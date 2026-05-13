@@ -40,4 +40,13 @@ else
   echo "kubectl already installed, skipping"
 fi
 
+# Install code-server to /workspaces/.local (persistent across pod restarts)
+if [ ! -f /workspaces/.local/bin/code-server ]; then
+  echo "Installing code-server to /workspaces/.local..."
+  mkdir -p /workspaces/.local/lib/code-server
+  retry 5 5 bash -c 'curl -fsSL https://code-server.dev/install.sh | sh -s -- --prefix=/workspaces/.local'
+else
+  echo "code-server already installed, skipping"
+fi
+
 echo "=== Setup Complete ==="
