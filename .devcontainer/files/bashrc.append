@@ -1,0 +1,23 @@
+# --- BEGIN devpod-alauda-dev managed (do not edit between markers) ---
+# Reverse SSH tunnel to local Mac (ssh alias `mac` -> localhost:2223 if user has set up the tunnel)
+mac() { ssh mac "$@"; }
+alias cc=/workspaces/.local/bin/claude
+
+# Daily ACP kubeconfig sync.
+# Resolves the current daily URL via the stable redirect daily-devops.alaudatech.net,
+# then drops one kubeconfig per matched cluster into /workspaces/.kube/configs/.
+# Default scopes to --cluster=kychen; pass extra args (--dry-run, --force, ...) through.
+acp-sync-daily() {
+  local stable=http://daily-devops.alaudatech.net/
+  local resolved base
+  resolved=$(curl -Ls -o /dev/null -w "%{url_effective}" --max-time 10 "$stable") \
+    || { echo "❌ resolve daily-devops.alaudatech.net 失败 — daily 入口可能挂了" >&2; return 2; }
+  base=$(printf '%s' "$resolved" | sed -E 's,^(https?://[^/]+).*,\1/,')
+  curl -sSk --max-time 6 -o /dev/null "${base}dex/pubkey" \
+    || { echo "❌ resolved=$base 的 /dex/pubkey 不通 — 这个 daily 正在轮换" >&2; return 3; }
+  printf '→ daily = %s\n' "$base" >&2
+  /workspaces/.local/bin/acp-kubeconfig-sync "$base" \
+    --out-dir /workspaces/.kube/configs \
+    --cluster=kychen "$@"
+}
+# --- END devpod-alauda-dev managed ---

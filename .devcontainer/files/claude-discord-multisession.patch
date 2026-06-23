@@ -1,0 +1,619 @@
+diff --git a/skills/launch/SKILL.md b/skills/launch/SKILL.md
+index 51278f0..9ed659c 100644
+--- a/skills/launch/SKILL.md
++++ b/skills/launch/SKILL.md
+@@ -94,14 +94,18 @@ claude-<base>-<sid>
+ ```
+ 
+ - `<sid>` — the 12-hex binding key from `derive-binding-key.sh` above.
+-- `<base>` — the launch cwd's basename, sanitized so every character outside
+-  `[A-Za-z0-9_-]` becomes `-`:
+-  `base=$(basename "$launch_cwd" | sed 's/[^A-Za-z0-9_-]/-/g')`.
++- `<base>` — the session's **display name**, sanitized so every character
++  outside `[A-Za-z0-9_-]` becomes `-`. It is the `--name` label when one was
++  given, otherwise the *source* directory basename — the repo basename in
++  worktree mode, or the launch cwd basename in in-place mode. The generated
++  `s-<6hex>` worktree label is deliberately **not** used here: it exists only
++  to keep the worktree path and branch unique and must never leak into the
++  human-facing session name. Step 6 of `start` has the exact derivation.
+ 
+ The `bindings.json` key stays the bare `<sid>`; only the zellij session name
+-carries the basename, for readability in `zellij list-sessions` and
+-`zellij attach`. A worktree launch (cwd `/workspaces/.worktrees/<repo>-<label>`)
+-therefore yields `claude-<repo>-<label>-<sid>`.
++carries the display name, for readability in `zellij list-sessions` and
++`zellij attach`. A worktree launch off repo `foo` therefore yields
++`claude-foo-<sid>`, or `claude-<label>-<sid>` when `--name <label>` is given.
+ 
+ To recover the sid from a session name, take the segment after the final `-`:
+ `sid="${session##*-}"`. Because `<sid>` is always the trailing 12-hex segment,
+@@ -133,6 +137,10 @@ Conventions:
+ - Each worktree gets a new branch `claude/<label>`, branched from the repo's
+   current `HEAD`.
+ - `<label>` comes from `--name` if given, otherwise a generated `s-<6hex>`.
++- The label keeps the worktree path and branch unique. It does **not** drive
++  the zellij session name or the Discord thread name — those use the display
++  name (see "Session identity"), so an auto-generated label never surfaces in
++  user-facing names.
+ 
+ Worktree-vs-in-place is decided only at creation time. Sessions launched
+ before this behavior existed keep running in place; there is no retroactive
+@@ -236,9 +244,20 @@ worktree instead of the repo directory — see "Worktree mode" above.
+    If the helper fails (bun missing, non-zero exit), surface its stderr and
+    stop.
+ 
+-6. **Compute the session name and check for an existing zellij session.**
++6. **Compute the display name and session name, then check for an existing
++   zellij session.** The display name is the `--name` label if given,
++   otherwise the source directory basename — the repo basename in worktree
++   mode (`$repo` is set by step 4), or the launch cwd basename in in-place
++   mode. The `s-<6hex>` worktree label is never used here.
+    ```sh
+-   base=$(basename "$launch_cwd" | sed 's/[^A-Za-z0-9_-]/-/g')
++   if [ -n "$name" ]; then
++     display="$name"
++   elif [ -n "$repo" ]; then
++     display=$(basename "$repo")
++   else
++     display=$(basename "$launch_cwd")
++   fi
++   base=$(printf '%s' "$display" | sed 's/[^A-Za-z0-9_-]/-/g')
+    session="claude-${base}-${sid}"
+    line=$(env -u ZELLIJ -u ZELLIJ_SESSION_NAME zellij list-sessions --no-formatting 2>/dev/null \
+      | grep -E -- "-${sid}( |$)" | head -1)
+@@ -264,42 +283,49 @@ worktree instead of the repo directory — see "Worktree mode" above.
+ 
+ 7. **Launch the zellij session.** Set `DISCORD_THREAD_ID=auto` so the daemon
+    creates (or reuses, when `bindings.json` already has an entry for this
+-   sid) the thread. Optional `DISCORD_THREAD_NAME` from `--name`.
++   sid) the thread. Always pass `DISCORD_THREAD_NAME` set to the display name
++   from step 6 — the daemon's `deriveThreadName` then uses it verbatim
++   instead of falling back to the worktree directory basename (which carries
++   the `s-<6hex>` label). The shim sanitises the name to `[\w .-]` and caps
++   it at 90 chars, so pass `$display` through without pre-sanitising.
+    ```sh
+-   cmd='DISCORD_THREAD_ID=auto'
+-   if [ -n "$name" ]; then
+-     # The shim sanitises the name to [\w .-] and caps at 90 chars. Pass it
+-     # through; don't try to pre-sanitise here.
+-     cmd="$cmd DISCORD_THREAD_NAME=$(printf %q "$name")"
+-   fi
++   cmd="DISCORD_THREAD_ID=auto DISCORD_THREAD_NAME=$(printf %q "$display")"
+    cmd="$cmd claude --dangerously-load-development-channels plugin:discord@danielfbm-discord"
+    env -u ZELLIJ -u ZELLIJ_SESSION_NAME zellij attach --create-background "$session"
+    env -u ZELLIJ -u ZELLIJ_SESSION_NAME zellij -s "$session" run \
+-     --in-place --close-replaced-pane --close-on-exit --cwd "$launch_cwd" \
+-     -- bash -lc "$cmd"
++     --close-on-exit --cwd "$launch_cwd" -- bash -lc "$cmd"
+    ```
+    `attach --create-background` creates the detached session with a default
+-   shell pane; `run --in-place --close-replaced-pane` replaces that pane with
+-   the Claude pane, leaving a clean single-pane session. If the running
+-   `--in-place` behavior misbehaves against a freshly created background
+-   session, fall back to a plain `zellij -s "$session" run --close-on-exit
+-   --cwd "$launch_cwd" -- bash -lc "$cmd"` and leave the default shell pane.
++   shell pane; the plain `run` then adds the Claude pane beside it. A
++   `run --in-place --close-replaced-pane` would yield a tidier single-pane
++   session, but on some hosts `--in-place` silently fails to launch the
++   command against a freshly created background session — leaving only the
++   idle shell pane and no Claude. Plain `run` is therefore the default; the
++   leftover shell pane is harmless (`list`/`stop`/`purge` key off the session
++   name, not the pane count).
+ 
+ 8. **Confirm the dev-channels prompt.** `claude
+-   --dangerously-load-development-channels` shows an interactive "I am using
+-   this for local development" prompt on every launch. Dismiss it with the
+-   helper, which attaches a transient pty-backed client, polls for the
+-   prompt, sends Enter, and detaches:
++   --dangerously-load-development-channels` *may* show an interactive "I am
++   using this for local development" prompt. Dismiss it with the helper,
++   which attaches a transient pty-backed client, polls for the prompt, sends
++   Enter, and detaches:
+    ```sh
+    if ! /workspaces/claude-discord-multisession/scripts/await-dev-channels-prompt.sh "$session"; then
+-     echo "dev-channels prompt did not appear within 30s — attach to '$session' and press Enter manually"
++     echo "dev-channels prompt not seen in 30s — usually means the trust is"
++     echo "already remembered and the prompt never appeared; harmless. If the"
++     echo "session looks stuck, attach to '$session' and press Enter manually."
+    fi
+    ```
+    `zellij action` only delivers to a session that has a client attached,
+    and launched sessions are created detached — that is why the helper
+-   supplies a transient client for the few seconds the Enter delivery
+-   needs. On timeout the helper exits non-zero and the skill tells the
+-   user to press Enter manually; the session keeps running.
++   supplies a transient client for the few seconds the Enter delivery needs.
++   The prompt only appears the first time this host accepts the
++   development-channels flag; once accepted the trust is remembered, so on
++   later launches the helper finds nothing to dismiss and exits non-zero.
++   That timeout is **expected and harmless** — do not treat it as a launch
++   failure. Verify success by step 9 instead (a `bindings.json` entry with a
++   `thread_id`, and `register outcome=ok` in `daemon.log`), not by this
++   helper's exit code.
+ 
+ 9. **Surface the thread_id.** Poll `bindings.json` up to ~5 s — the daemon
+    writes the entry after the shim registers:
+diff --git a/src/bindings.ts b/src/bindings.ts
+index 716b80e..3cdddc6 100644
+--- a/src/bindings.ts
++++ b/src/bindings.ts
+@@ -138,6 +138,24 @@ export function migrateBindingKey(
+   })
+ }
+ 
++/**
++ * Delete a single binding entry, preserving everything else on disk.
++ *
++ * Same per-file critical-section discipline as `upsertBinding` /
++ * `migrateBindingKey`: load-modify-write inside the queued lock so a parallel
++ * upsert cannot resurrect the entry we just deleted (or vice versa). No-op
++ * (resolved promise) when the file or entry is absent — callers can fire and
++ * forget on cleanup paths without having to probe first.
++ */
++export function removeBinding(file: string, sessionId: string): Promise<void> {
++  return enqueue(file, () => {
++    const current = loadBindings(file)
++    if (!(sessionId in current)) return
++    delete current[sessionId]
++    writeAtomic(file, JSON.stringify(current, null, 2) + '\n')
++  })
++}
++
+ /**
+  * Whole-state write. Kept for tests and tooling that legitimately want to
+  * replace the entire file (e.g. fixtures, migrations). Production daemon code
+diff --git a/src/daemon-entry.ts b/src/daemon-entry.ts
+index 9f24f1d..d26115c 100644
+--- a/src/daemon-entry.ts
++++ b/src/daemon-entry.ts
+@@ -211,6 +211,17 @@ export async function runDaemon(): Promise<void> {
+     }
+   }, 5000).unref()
+ 
++  // Auto-recreate threads on user-side deletion. discord.js fires
++  // `threadDelete` whenever a thread the bot can see is removed (either
++  // archive-then-delete in the UI or an explicit delete API call); the
++  // daemon mints a replacement thread, rewires the bound session, and
++  // posts an onboarding message. See `handleThreadDeleted` in daemon.ts.
++  client.on('threadDelete', thread => {
++    void handle.handleThreadDeleted(thread.id).catch(err => {
++      process.stderr.write(`discord daemon: handleThreadDeleted ${thread.id} failed: ${err}\n`)
++    })
++  })
++
+   client.once('ready', c => {
+     process.stderr.write(`discord daemon: gateway connected as ${c.user.tag}\n`)
+   })
+diff --git a/src/daemon.ts b/src/daemon.ts
+index 0ebc601..c39eb69 100644
+--- a/src/daemon.ts
++++ b/src/daemon.ts
+@@ -6,7 +6,7 @@ import { parseShimMsg, AskQuestionSchema } from './protocol'
+ import type { DiscordOps, AskRoute, AskResult } from './discord-ops'
+ import { z } from 'zod'
+ import { loadAccess, saveAccess, pruneExpired } from './access'
+-import { loadBindings, upsertBinding, migrateBindingKey } from './bindings'
++import { loadBindings, upsertBinding, migrateBindingKey, removeBinding } from './bindings'
+ import { deriveThreadName } from './session-id'
+ import { gate, type GateInput } from './gate'
+ 
+@@ -51,6 +51,18 @@ export type DaemonHandle = {
+   deliverInbound(ev: InboundEvent): void
+   permissionDecision(request_id: string, behavior: 'allow' | 'deny'): void
+   pendingPermissions: Map<string, PendingPermission>
++  /**
++   * Forward a Discord `threadDelete` gateway event into the daemon. If the
++   * deleted thread is currently bound to a live session, the daemon creates
++   * a replacement thread under the same parent, rewires the session, persists
++   * the new binding, and posts an onboarding message inside the new thread.
++   *
++   * Subsequent tool calls that still reference the old thread_id (Claude's
++   * conversation history contains the now-dead snowflake from earlier
++   * inbound tags) are transparently redirected to the new thread via the
++   * daemon's `redirectMap`, so in-flight replies do not fail.
++   */
++  handleThreadDeleted(threadId: string): Promise<void>
+ }
+ 
+ type Session = {
+@@ -254,8 +266,31 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+   const threadIndex = new Map<string, string>()  // thread_id → session_id
+   const permRoutes = new Map<string, string>()   // request_id → session_id
+   const pendingPermissions = new Map<string, PendingPermission>()
++  // Stale thread_id → currently-bound thread_id. Populated when a Discord
++  // `threadDelete` event fires for a bound thread and the daemon recreates
++  // a replacement: tool calls that still reference the dead snowflake (from
++  // Claude's pre-deletion conversation history) get transparently rewritten
++  // here before reaching `ops.*`, so an in-flight `reply` doesn't 404.
++  // Entries are kept for the daemon's lifetime — they're tiny (snowflake →
++  // snowflake) and there's no upper bound on how long Claude's transcript
++  // might hold onto a stale id.
++  const redirectMap = new Map<string, string>()
+   let dmSessionId: string | null = null
+ 
++  // Walk `redirectMap` to find the currently-live thread for a chat_id.
++  // The hop counter caps the walk so a freak cycle (shouldn't happen — new
++  // thread snowflakes are minted by Discord and never collide with prior
++  // ids) cannot hang the tool dispatcher.
++  function liveChat(chatId: string): string {
++    let cur = chatId
++    for (let hops = 0; hops < 8; hops++) {
++      const next = redirectMap.get(cur)
++      if (!next || next === cur) return cur
++      cur = next
++    }
++    return cur
++  }
++
+   function deliverInbound(ev: InboundEvent): void {
+     const access = loadAccess(accessFile)
+     const pruned = pruneExpired(access)
+@@ -318,6 +353,117 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+     writeFrame(s.sock, { type: 'permission_decision', request_id, behavior })
+   }
+ 
++  /**
++   * Handle a Discord `threadDelete` gateway event by:
++   *   1. Looking up the session bound to the deleted thread.
++   *   2. Creating a replacement thread under the same parent channel.
++   *   3. Rewiring `threadIndex`, the in-memory `Session.thread_id`, and
++   *      `bindings.json` so future inbound messages route to the new thread.
++   *   4. Recording a `redirectMap` entry so in-flight outbound tool calls
++   *      that still carry the dead thread_id (Claude's transcript holds the
++   *      pre-deletion snowflake) get transparently rewritten.
++   *   5. Posting a short onboarding message in the new thread so the user
++   *      sees what happened. The bot's own message does NOT round-trip to
++   *      Claude (the messageCreate handler filters `author.bot`), so Claude
++   *      learns the new thread_id only when the user next posts there.
++   *
++   * No-op when:
++   *   - the thread wasn't bound to anything (e.g. user deleted an unrelated
++   *     thread under the parent channel),
++   *   - the session no longer has an active shim (we still clean up the
++   *     binding and threadIndex so a fresh shim launch creates a fresh thread),
++   *   - `parentChannelId` is unset (recreate isn't possible; we clean up so
++   *     the next launch with DISCORD_THREAD_ID=auto starts fresh).
++   *
++   * Re-entrancy: serialized only by the JS event loop. discord.js dispatches
++   * threadDelete events one at a time from the gateway, so concurrent calls
++   * for the same threadId shouldn't occur in practice. If they did, the
++   * first call's `threadIndex.delete(threadId)` makes the second a no-op.
++   */
++  async function handleThreadDeleted(threadId: string): Promise<void> {
++    const sessionId = threadIndex.get(threadId)
++    if (!sessionId) return  // not bound — unrelated thread under the parent
++    threadIndex.delete(threadId)
++
++    const sess = sessions.get(sessionId)
++
++    // Best-effort load of the existing binding so we preserve cwd /
++    // canonical_cwd / created_at across the recreate. Read failures are
++    // tolerated — we'll fall through to a thin record built from the live
++    // session's state if there's an active shim, or just remove the entry.
++    let oldBinding: ReturnType<typeof loadBindings>[string] | undefined
++    try { oldBinding = loadBindings(bindingsFile)[sessionId] } catch {}
++
++    const access = loadAccess(accessFile)
++    if (!access.parentChannelId) {
++      // No parent configured (probably the user is in DM mode and somehow
++      // got a thread delete event for a stale binding). Best we can do is
++      // drop the now-pointless binding so a future register starts clean.
++      process.stderr.write(`discord daemon: thread ${threadId} (session ${sessionId}) deleted but parentChannelId unset; cleaning binding\n`)
++      await removeBinding(bindingsFile, sessionId).catch(err => {
++        process.stderr.write(`discord daemon: removeBinding failed for ${sessionId}: ${err}\n`)
++      })
++      if (sess) sess.thread_id = null
++      return
++    }
++
++    const name = deriveThreadName(oldBinding?.cwd ?? '', sessionId, undefined)
++    let newThread: { thread_id: string; thread_name: string; thread_url?: string }
++    try {
++      if (waitReady) await waitReady()
++      newThread = await ops.createThread(access.parentChannelId, name)
++    } catch (err) {
++      process.stderr.write(`discord daemon: createThread on recreate failed for session ${sessionId}: ${err}\n`)
++      // Recreate failed — drop the binding so the user's next launch creates
++      // a fresh thread cleanly rather than reusing the dead snowflake.
++      await removeBinding(bindingsFile, sessionId).catch(e => {
++        process.stderr.write(`discord daemon: removeBinding failed for ${sessionId}: ${e}\n`)
++      })
++      if (sess) sess.thread_id = null
++      return
++    }
++
++    threadIndex.set(newThread.thread_id, sessionId)
++    if (sess) {
++      sess.thread_id = newThread.thread_id
++      sess.parent_id = access.parentChannelId
++    }
++
++    // Redirect the stale id (and anything that was already redirected to it)
++    // to the new thread. The "transitive rewrite" pass handles the rare case
++    // of repeat deletions: T1 → T2 → T3 should collapse to T1 → T3 so a
++    // single liveChat() walk resolves.
++    redirectMap.set(threadId, newThread.thread_id)
++    for (const [from, to] of redirectMap) {
++      if (to === threadId) redirectMap.set(from, newThread.thread_id)
++    }
++
++    try {
++      await upsertBinding(bindingsFile, sessionId, {
++        thread_id: newThread.thread_id,
++        cwd: oldBinding?.cwd ?? '',
++        created_at: oldBinding?.created_at ?? Date.now(),
++        last_seen_at: Date.now(),
++        ...(oldBinding?.canonical_cwd !== undefined ? { canonical_cwd: oldBinding.canonical_cwd } : {}),
++      })
++    } catch (err) {
++      process.stderr.write(`discord daemon: bindings save failed on recreate for ${sessionId}: ${err}\n`)
++      // Don't roll back: we've already created and rewired to the new
++      // thread, so disk failure is recoverable on next launch (it'll just
++      // re-derive a fresh thread instead of reusing this one).
++    }
++
++    // Onboarding message so the user sees the new thread exists and why.
++    // Fire-and-forget; a Discord post failure shouldn't undo the rewire.
++    const cwdHint = oldBinding?.cwd ? ` for \`${oldBinding.cwd}\`` : ''
++    void ops.reply(
++      newThread.thread_id,
++      `🔄 Previous thread was deleted in Discord — continuing the session${cwdHint} here. (was: \`${threadId}\`)`,
++    ).catch(err => {
++      process.stderr.write(`discord daemon: onboarding reply failed for ${newThread.thread_id}: ${err}\n`)
++    })
++  }
++
+   const clients = new Set<Socket>()
+   let idleTimer: NodeJS.Timeout | null = null
+   function armIdle() {
+@@ -405,7 +551,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+           ] as const, { content: 'text', message: 'text', message_id: 'reply_to' })
+           if (!v.ok) return fail(v.error)
+           const ids = await ops.reply(
+-            v.args.chat_id,
++            liveChat(v.args.chat_id),
+             v.args.text,
+             { reply_to: v.args.reply_to, files: v.args.files },
+           )
+@@ -419,7 +565,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+             { name: 'emoji', type: 'string', required: true },
+           ] as const, { text: 'emoji', content: 'emoji', reply_to: 'message_id' })
+           if (!v.ok) return fail(v.error)
+-          await ops.react(v.args.chat_id, v.args.message_id, v.args.emoji)
++          await ops.react(liveChat(v.args.chat_id), v.args.message_id, v.args.emoji)
+           return { content: [{ type: 'text', text: 'reacted' }] }
+         }
+         case 'edit_message': {
+@@ -429,7 +575,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+             { name: 'text', type: 'string', required: true },
+           ] as const, { content: 'text', message: 'text', reply_to: 'message_id' })
+           if (!v.ok) return fail(v.error)
+-          const id = await ops.edit(v.args.chat_id, v.args.message_id, v.args.text)
++          const id = await ops.edit(liveChat(v.args.chat_id), v.args.message_id, v.args.text)
+           return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+         }
+         case 'fetch_messages': {
+@@ -446,7 +592,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+           // limit is now guaranteed `number | undefined` by the validator,
+           // so the previous `Number(args.limit ?? 20)` coercion is gone.
+           const limit = v.args.limit ?? 20
+-          const arr = await ops.fetch(v.args.channel, limit)
++          const arr = await ops.fetch(liveChat(v.args.channel), limit)
+           const out = arr.length === 0
+             ? '(no messages)'
+             : arr.map(m =>
+@@ -461,7 +607,7 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+           ] as const, { reply_to: 'message_id' })
+           if (!v.ok) return fail(v.error)
+           const inboxDir = join(stateDir, 'inbox')
+-          const out = await ops.downloadAttachments(v.args.chat_id, v.args.message_id, inboxDir)
++          const out = await ops.downloadAttachments(liveChat(v.args.chat_id), v.args.message_id, inboxDir)
+           if (out.length === 0) return { content: [{ type: 'text', text: 'message has no attachments' }] }
+           const lines = out.map(f => `  ${f.path}  (${f.name}, ${f.type}, ${(f.bytes / 1024).toFixed(0)}KB)`)
+           return { content: [{ type: 'text', text: `downloaded ${out.length} attachment(s):\n${lines.join('\n')}` }] }
+@@ -895,5 +1041,5 @@ export async function startDaemon(opts: DaemonOpts): Promise<DaemonHandle> {
+ 
+   armIdle()
+ 
+-  return { shutdown, deliverInbound, permissionDecision, pendingPermissions }
++  return { shutdown, deliverInbound, permissionDecision, pendingPermissions, handleThreadDeleted }
+ }
+diff --git a/tests/bindings.test.ts b/tests/bindings.test.ts
+index cec4638..35c8199 100644
+--- a/tests/bindings.test.ts
++++ b/tests/bindings.test.ts
+@@ -7,6 +7,7 @@ import {
+   saveBindings,
+   upsertBinding,
+   migrateBindingKey,
++  removeBinding,
+   type Bindings,
+ } from '../src/bindings'
+ 
+@@ -213,6 +214,50 @@ describe('bindings', () => {
+       })
+     })
+ 
++    describe('removeBinding', () => {
++      test('deletes the named entry and leaves others intact', async () => {
++        await saveBindings(file, {
++          keep: { thread_id: 't-keep', cwd: '/k', created_at: 1, last_seen_at: 2 },
++          drop: { thread_id: 't-drop', cwd: '/d', created_at: 3, last_seen_at: 4 },
++        })
++        await removeBinding(file, 'drop')
++        expect(loadBindings(file)).toEqual({
++          keep: { thread_id: 't-keep', cwd: '/k', created_at: 1, last_seen_at: 2 },
++        })
++      })
++
++      test('no-op when entry absent', async () => {
++        await saveBindings(file, {
++          keep: { thread_id: 't-keep', cwd: '/k', created_at: 1, last_seen_at: 2 },
++        })
++        await removeBinding(file, 'never-existed')
++        expect(loadBindings(file)).toEqual({
++          keep: { thread_id: 't-keep', cwd: '/k', created_at: 1, last_seen_at: 2 },
++        })
++      })
++
++      test('no-op when file absent', async () => {
++        await removeBinding(file, 'whatever')
++        expect(existsSync(file)).toBe(false)
++      })
++
++      // Locks the queue ordering invariant: a remove enqueued AFTER an upsert
++      // for the same key must win, not race. The prior naive load-modify-write
++      // without a shared mutex would let the upsert's queued write resurrect
++      // the entry the remove just deleted.
++      test('serialized against concurrent upsert on same key', async () => {
++        const writes: Promise<void>[] = []
++        for (let i = 0; i < 5; i++) {
++          writes.push(upsertBinding(file, 'sid', {
++            thread_id: `t-${i}`, cwd: `/c-${i}`, created_at: i, last_seen_at: i + 1,
++          }))
++        }
++        writes.push(removeBinding(file, 'sid'))
++        await Promise.all(writes)
++        expect(loadBindings(file).sid).toBeUndefined()
++      })
++    })
++
+     test('mid-flight external edit between upserts is preserved', async () => {
+       await upsertBinding(file, 'first', {
+         thread_id: 't1', cwd: '/1', created_at: 1, last_seen_at: 2,
+diff --git a/tests/daemon-shim.integration.test.ts b/tests/daemon-shim.integration.test.ts
+index bf8de07..78219aa 100644
+--- a/tests/daemon-shim.integration.test.ts
++++ b/tests/daemon-shim.integration.test.ts
+@@ -985,3 +985,131 @@ describe('daemon: register', () => {
+     expect(reply.error).toMatch(/no registered session/)
+   })
+ })
++
++describe('daemon: handleThreadDeleted', () => {
++  // When a bound thread is deleted in Discord, the daemon should:
++  //   1. Create a replacement thread under the same parent.
++  //   2. Rewire threadIndex so the new thread routes to the same session.
++  //   3. Persist the new thread_id to bindings.json (preserving cwd/created_at).
++  //   4. Post an onboarding message in the new thread.
++  //   5. Auto-rewrite stale chat_id args on subsequent tool calls so Claude's
++  //      pre-deletion conversation history keeps working.
++  test('recreates thread, rewires session, rewrites stale chat_id in tool calls', async () => {
++    const ops = new FakeDiscordOps()
++    const { saveAccess, defaultAccess } = await import('../src/access')
++    const { loadBindings } = await import('../src/bindings')
++    const a = defaultAccess()
++    a.parentChannelId = 'parent-1'
++    a.groups['parent-1'] = { requireMention: false, allowFrom: [] }
++    saveAccess(join(dir, 'access.json'), a)
++
++    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
++
++    const sock = await connect(join(dir, 'daemon.sock'))
++    const it = frameIterator(sock)
++    writeFrame(sock, { type: 'register', id: 1, session_id: 'sess-recreate', mode: 'thread', cwd: '/repo/my-app', thread_id: 'auto' })
++    const ack = await recv(it)
++    expect(ack.type).toBe('register_ack')
++    const oldThread = ack.thread_id as string
++    expect(oldThread).toMatch(/^fake-thread-/)
++
++    // Sanity: an inbound on the old thread reaches the shim.
++    daemon!.deliverInbound!({
++      chat_id: oldThread, message_id: 'm1', user: 'alice', user_id: 'u1',
++      ts: '2026-01-01T00:00:00Z', content: 'before delete', isDM: false, parentChannelId: 'parent-1',
++      hasBotMention: false, isReplyToBot: false, attachments: [],
++    })
++    expect((await recv(it)).content).toBe('before delete')
++
++    // Simulate the gateway threadDelete event.
++    await daemon!.handleThreadDeleted!(oldThread)
++
++    // Expect: createThread called a second time under the same parent.
++    const creates = ops.calls.filter(c => c.kind === 'createThread')
++    expect(creates).toHaveLength(2)
++    const newThread = creates[1].thread_id as string
++    expect(newThread).not.toBe(oldThread)
++
++    // Onboarding reply posted in the new thread.
++    const onboardingReply = ops.calls.find(c => c.kind === 'reply' && c.chat_id === newThread) as any
++    expect(onboardingReply).toBeTruthy()
++    expect(onboardingReply.text).toMatch(/Previous thread was deleted/)
++    expect(onboardingReply.text).toContain(oldThread)
++    expect(onboardingReply.text).toContain('/repo/my-app')
++
++    // bindings.json now points at the new thread for the same session.
++    const onDisk = loadBindings(join(dir, 'bindings.json'))
++    expect(onDisk['sess-recreate'].thread_id).toBe(newThread)
++    expect(onDisk['sess-recreate'].cwd).toBe('/repo/my-app')
++
++    // Inbound on the new thread routes to the same shim — proves threadIndex
++    // was rewired without re-registering.
++    daemon!.deliverInbound!({
++      chat_id: newThread, message_id: 'm2', user: 'alice', user_id: 'u1',
++      ts: '2026-01-01T00:00:01Z', content: 'after recreate', isDM: false, parentChannelId: 'parent-1',
++      hasBotMention: false, isReplyToBot: false, attachments: [],
++    })
++    expect((await recv(it)).content).toBe('after recreate')
++
++    // The redirect: a tool call that still carries the dead snowflake (Claude
++    // pulled it from pre-deletion transcript) is rewritten to the new thread.
++    writeFrame(sock, { type: 'tool_call', id: 99, name: 'reply', args: { chat_id: oldThread, text: 'using stale id' } })
++    const toolResult = await recv(it)
++    expect(toolResult.type).toBe('tool_result')
++    expect(toolResult.isError).toBeUndefined()
++    const stalePathReply = ops.calls.find(c => c.kind === 'reply' && c.text === 'using stale id') as any
++    expect(stalePathReply).toBeTruthy()
++    expect(stalePathReply.chat_id).toBe(newThread)  // rewritten, not oldThread
++  })
++
++  // Defensive path: parent unset. Daemon can't recreate without a parent, so
++  // it should drop the binding cleanly (next launch with thread_id=auto sees
++  // no binding → creates a fresh thread). Locks the "don't leave a stale
++  // binding on disk pointing at a dead thread" invariant.
++  test('drops binding when parentChannelId is unset', async () => {
++    const ops = new FakeDiscordOps()
++    const { saveAccess, defaultAccess } = await import('../src/access')
++    const { saveBindings, loadBindings } = await import('../src/bindings')
++    saveAccess(join(dir, 'access.json'), defaultAccess())
++    await saveBindings(join(dir, 'bindings.json'), {
++      'sess-orphan': { thread_id: 'dead-thread', cwd: '/x', created_at: 1, last_seen_at: 2 },
++    })
++
++    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
++    // Seed threadIndex by faking a register flow is overkill here — the
++    // handler reads threadIndex synchronously. We can't reach the in-daemon
++    // map from outside, so register a real thread session and then simulate
++    // its deletion below. (Without parentChannelId set we can't register a
++    // thread, so set it just for register, then clear and re-load.)
++    const a2 = defaultAccess()
++    a2.parentChannelId = 'parent-1'
++    a2.groups['parent-1'] = { requireMention: false, allowFrom: [] }
++    saveAccess(join(dir, 'access.json'), a2)
++
++    const sock = await connect(join(dir, 'daemon.sock'))
++    const it = frameIterator(sock)
++    writeFrame(sock, { type: 'register', id: 1, session_id: 's-parentless', mode: 'thread', cwd: '/x', thread_id: 'auto' })
++    const ack = await recv(it)
++    expect(ack.type).toBe('register_ack')
++    const threadId = ack.thread_id as string
++
++    // Clear parentChannelId after the register, before invoking the handler.
++    saveAccess(join(dir, 'access.json'), defaultAccess())
++
++    await daemon!.handleThreadDeleted!(threadId)
++
++    // No second createThread call — recreate was skipped.
++    expect(ops.calls.filter(c => c.kind === 'createThread')).toHaveLength(1)
++    // Binding was dropped so the next launch can start fresh.
++    expect(loadBindings(join(dir, 'bindings.json'))['s-parentless']).toBeUndefined()
++  })
++
++  // Unknown thread (no entry in threadIndex). Common case: user deletes some
++  // unrelated thread under the parent channel. Handler should silently no-op.
++  test('no-op when thread is not bound', async () => {
++    const ops = new FakeDiscordOps()
++    daemon = await startDaemon({ stateDir: dir, ops, idleExitMs: 60_000 })
++    await daemon.handleThreadDeleted('never-bound-thread')
++    expect(ops.calls).toEqual([])
++  })
++})
