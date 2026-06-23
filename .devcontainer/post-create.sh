@@ -108,7 +108,7 @@ fi
 # Pin to the commit that files/claude-discord-multisession.patch was generated
 # against so the patch always applies cleanly. Refresh both when you rebase.
 PLUGIN_DIR=/workspaces/claude-discord-multisession
-PLUGIN_COMMIT=16e9d16
+PLUGIN_COMMIT=525b89797a2871f2e3602cb9cc1e6bb87f1b0854
 if [ ! -d "$PLUGIN_DIR/.git" ]; then
   echo "Cloning claude-discord-multisession (pinned to $PLUGIN_COMMIT)..."
   retry 3 5 git clone https://github.com/danielfbm/claude-discord-multisession.git "$PLUGIN_DIR"
