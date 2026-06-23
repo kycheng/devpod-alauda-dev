@@ -36,7 +36,7 @@ jobs:
 
       - name: cold run — first invocation of post-create.sh
         run: |
-          sudo -u vscode -H bash -lc 'cd $GITHUB_WORKSPACE && bash .devcontainer/post-create.sh' \
+          sudo -u vscode -H bash -lc "cd '$GITHUB_WORKSPACE' && bash .devcontainer/post-create.sh" \
             | tee /tmp/cold.log
 
       - name: assertions after cold run
@@ -67,7 +67,7 @@ jobs:
 
       - name: warm run — second invocation must be idempotent
         run: |
-          sudo -u vscode -H bash -lc 'cd $GITHUB_WORKSPACE && bash .devcontainer/post-create.sh' \
+          sudo -u vscode -H bash -lc "cd '$GITHUB_WORKSPACE' && bash .devcontainer/post-create.sh" \
             | tee /tmp/warm.log
 
       - name: assertions after warm run
