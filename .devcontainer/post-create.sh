@@ -129,6 +129,17 @@ if [ -f "$FILES_DIR/acp-kubeconfig-sync" ]; then
   echo "acp-kubeconfig-sync installed at /workspaces/.local/bin/acp-kubeconfig-sync"
 fi
 
+# --- devpod.env (seed example if absent; never overwrite the live file) ----
+DEVPOD_ENV=/workspaces/.claude/devpod.env
+if [ ! -f "$DEVPOD_ENV" ] && [ -f "$FILES_DIR/devpod.env.example" ]; then
+  echo "Seeding $DEVPOD_ENV from example (placeholder values — fill in for your env)..."
+  mkdir -p /workspaces/.claude
+  cp "$FILES_DIR/devpod.env.example" "$DEVPOD_ENV"
+  chmod 600 "$DEVPOD_ENV"
+elif [ -f "$DEVPOD_ENV" ]; then
+  echo "$DEVPOD_ENV already exists, leaving it alone"
+fi
+
 # --- bashrc helpers (sentinel-guarded, idempotent) -------------------------
 BASHRC=/workspaces/.bashrc
 if [ -f "$BASHRC" ] && [ -f "$FILES_DIR/bashrc.append" ]; then

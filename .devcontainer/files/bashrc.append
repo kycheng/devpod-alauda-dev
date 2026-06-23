@@ -1,23 +1,32 @@
 # --- BEGIN devpod-alauda-dev managed (do not edit between markers) ---
-# Reverse SSH tunnel to local Mac (ssh alias `mac` -> localhost:2223 if user has set up the tunnel)
+# Source local env (secrets, internal URLs) if present.
+# Copy /workspaces/devpod-alauda-dev/.devcontainer/files/devpod.env.example
+# to /workspaces/.claude/devpod.env and fill in values for your environment.
+[ -f /workspaces/.claude/devpod.env ] && set -a && source /workspaces/.claude/devpod.env && set +a
+
+# Reverse SSH tunnel to local machine.
+# Set up the tunnel from your machine: ssh -R 2223:localhost:22 <devpod-host>
+# Then `ssh mac` (the alias is in ~/.ssh/config) resolves to localhost:2223.
 mac() { ssh mac "$@"; }
 alias cc=/workspaces/.local/bin/claude
 
 # Daily ACP kubeconfig sync.
-# Resolves the current daily URL via the stable redirect daily-devops.alaudatech.net,
+# Resolves the current daily URL via the stable redirect $ACP_DAILY_ENTRY,
 # then drops one kubeconfig per matched cluster into /workspaces/.kube/configs/.
-# Default scopes to --cluster=kychen; pass extra args (--dry-run, --force, ...) through.
+# Required env: ACP_DAILY_ENTRY, ACP_DEFAULT_USER, ACP_DEFAULT_PASS
+# Optional env: ACP_DEFAULT_CLUSTER (default cluster filter)
 acp-sync-daily() {
-  local stable=http://daily-devops.alaudatech.net/
+  local entry="${ACP_DAILY_ENTRY:?set ACP_DAILY_ENTRY in /workspaces/.claude/devpod.env}"
+  local cluster="${ACP_DEFAULT_CLUSTER:-}"
   local resolved base
-  resolved=$(curl -Ls -o /dev/null -w "%{url_effective}" --max-time 10 "$stable") \
-    || { echo "❌ resolve daily-devops.alaudatech.net 失败 — daily 入口可能挂了" >&2; return 2; }
+  resolved=$(curl -Ls -o /dev/null -w "%{url_effective}" --max-time 10 "$entry") \
+    || { echo "❌ resolve $entry failed — daily entry may be down" >&2; return 2; }
   base=$(printf '%s' "$resolved" | sed -E 's,^(https?://[^/]+).*,\1/,')
   curl -sSk --max-time 6 -o /dev/null "${base}dex/pubkey" \
-    || { echo "❌ resolved=$base 的 /dex/pubkey 不通 — 这个 daily 正在轮换" >&2; return 3; }
+    || { echo "❌ resolved=$base /dex/pubkey unreachable — daily may be mid-rotation" >&2; return 3; }
   printf '→ daily = %s\n' "$base" >&2
-  /workspaces/.local/bin/acp-kubeconfig-sync "$base" \
-    --out-dir /workspaces/.kube/configs \
-    --cluster=kychen "$@"
+  local args=(--out-dir /workspaces/.kube/configs)
+  [ -n "$cluster" ] && args+=(--cluster="$cluster")
+  /workspaces/.local/bin/acp-kubeconfig-sync "$base" "${args[@]}" "$@"
 }
 # --- END devpod-alauda-dev managed ---

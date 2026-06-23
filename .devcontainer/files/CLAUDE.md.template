@@ -2,36 +2,36 @@
 
 ## Mac access (reverse SSH tunnel)
 
-Any reference to **"mac" / "Mac" / "本机" / "我的电脑" / "我的 Mac" / "MacBook"** (or equivalent references to the user's local machine) **in an action context** — running a command, checking state, reading a file, modifying something — means: execute it via `ssh mac <cmd>` from this devpod. The alias `mac` is preconfigured in the user's `~/.ssh/config` and resolves to `localhost:2223` (a reverse SSH tunnel the Mac established to this devpod), login user `mac`.
+Any reference to **"mac" / "Mac" / "本机" / "我的电脑" / "我的 Mac" / "MacBook"** (or equivalent references to the user's local machine) **in an action context** — running a command, checking state, reading a file, modifying something — means: execute it via `ssh mac <cmd>` from this devpod. The alias `mac` is expected to be preconfigured in the user's `~/.ssh/config` and resolves to `localhost:2223` (a reverse SSH tunnel the user established from their machine to this devpod), login user `mac`.
 
 Rules:
 
 - Just run `ssh mac <cmd>` directly. Do not ask permission, do not propose alternatives, do not fall back to running the command locally inside the devpod.
 - For multi-line scripts, pipe a here-doc into `ssh mac bash -s` so quoting stays sane.
-- Descriptive mentions ("我的 Mac 是 M2", "Mac 上的 SSH 配置我写好了") without an action verb don't fire this rule — but if intent is ambiguous and the natural read is "the user wants to know X about their Mac", default to running the obvious read-only inspection over the tunnel instead of asking.
-- If `ssh mac` fails (connection refused on 2223, hang, host key error), surface that fact verbatim and ask the user to re-establish the tunnel. Do NOT invent alternative channels (no Tailscale, no other host).
+- Descriptive mentions without an action verb don't fire this rule — but if intent is ambiguous and the natural read is "the user wants to know X about their Mac", default to running the obvious read-only inspection over the tunnel instead of asking.
+- If `ssh mac` fails (connection refused on 2223, hang, host key error), surface that fact verbatim and ask the user to re-establish the tunnel. Do NOT invent alternative channels.
 - A shell helper `mac() { ssh mac "$@"; }` is defined in `~/.bashrc`, so `mac <cmd>` is equivalent and shorter.
 
-## Edge cluster access (Alauda Container Platform — edge.alauda.cn)
+## Edge cluster access (long-lived ACP)
 
-For anything related to `edge.alauda.cn` (the Alauda Container Platform behind `https://edge.alauda.cn/`) — pipeline runs, task runs, namespace inspection, generic K8s queries, etc. — use the kubeconfig at **`/workspaces/.claude/edge.kubeconfig`**:
+For anything related to a long-lived ACP exposed to the user (the "edge" cluster they bind a long-lived AccessToken for) — pipeline runs, task runs, namespace inspection, generic K8s queries — use the kubeconfig at **`/workspaces/.claude/edge.kubeconfig`**:
 
 ```sh
 KUBECONFIG=/workspaces/.claude/edge.kubeconfig kubectl <verb> <resource> [-n <ns>]
 ```
 
-The kubeconfig file is **not shipped with the devpod**. On a fresh devpod the file won't exist; ask the user for a long-lived `AccessToken` JWT and drop a config of the form:
+The kubeconfig file is **not shipped with this repo**. On a fresh devpod, ask the user for their long-lived `AccessToken` JWT and drop a config of the form:
 
 ```yaml
 apiVersion: v1
 kind: Config
 clusters:
-- cluster: {insecure-skip-tls-verify: true, server: https://edge.alauda.cn/kubernetes/business-build}
-  name: business-build
+- cluster: {insecure-skip-tls-verify: true, server: https://<your-edge-host>/kubernetes/<cluster-name>}
+  name: <cluster-name>
 contexts:
-- context: {cluster: business-build, user: edge-<you>}
-  name: business-build
-current-context: business-build
+- context: {cluster: <cluster-name>, user: edge-<you>}
+  name: <cluster-name>
+current-context: <cluster-name>
 users:
 - name: edge-<you>
   user: {token: <PASTE_TOKEN>}
@@ -41,29 +41,31 @@ Then `chmod 600 /workspaces/.claude/edge.kubeconfig`. Never echo the token, neve
 
 Details:
 
-- Cluster: `business-build` → `https://edge.alauda.cn/kubernetes/business-build` (the path `/kubernetes/<cluster>` is ACP's K8s API gateway; root `https://edge.alauda.cn/` is the console, `/dex` is OIDC).
-- Pipeline platform is **Tekton** (`tekton.dev/v1`): `pipelineruns`, `taskruns`, `pipelines`, `tasks`.
-- DNS resolves `edge.alauda.cn` to 198.18.0.12 from this devpod (routed via the user's network setup); curl/kubectl reach it fine.
+- ACP exposes its K8s API at `/kubernetes/<cluster>` and OIDC at `/dex`; the root path is the console.
+- Pipeline platform is typically **Tekton** (`tekton.dev/v1`): `pipelineruns`, `taskruns`, `pipelines`, `tasks`.
 - For locating a specific run: if the user gives a PR / commit / pipeline name and not the namespace, fall back to `kubectl get pipelineruns -A | grep <substring>` to find the namespace first, then narrow with `-n`.
 
-## Daily ACP access (rotating daily env via acp-kubeconfig-sync)
+## Daily ACP access (rotating env via acp-kubeconfig-sync)
 
-For anything related to the user's **daily** Alauda ACP — kubectl against the current daily cluster, pipeline runs there, plugin upload flows, "刷新 / 登录 daily / acp login 失败" type asks — use the `acp-sync-daily` shell helper in `/workspaces/.bashrc`:
+For anything related to the user's **rotating daily** ACP environment — kubectl against the current daily cluster, pipeline runs there, plugin upload flows, "refresh / login daily / acp login failed" type asks — use the `acp-sync-daily` shell helper in `/workspaces/.bashrc`:
 
 ```sh
-acp-sync-daily            # resolve current daily URL, sync cluster `kychen` kubeconfig
+acp-sync-daily            # resolve current daily URL, sync default cluster's kubeconfig
 acp-sync-daily --dry-run  # see what it would do without writing
 acp-sync-daily --cluster=foo --cluster=bar  # override cluster filter
 ```
 
 Behind the scenes:
 
-- The current daily ACP rotates (its URL changes roughly monthly). **Never hardcode the rotating URL anywhere** — including in this file.
-- The **stable entry point** is `http://daily-devops.alaudatech.net/`, which 302-redirects to whichever daily is current. The helper resolves it via `curl -Ls -o /dev/null -w '%{url_effective}'` and uses the resulting `https://...--idp.alaudatech.net/` base.
-- This matches the Mac Claude's `acp-login` / `upload-plugin` skills — same contract, no parallel "how to find the URL" knowledge to drift.
+- The current daily ACP rotates (its URL changes periodically). **Never hardcode the rotating URL anywhere.**
+- The **stable entry point** comes from the `$ACP_DAILY_ENTRY` env var (set in `/workspaces/.claude/devpod.env`), which is expected to 302-redirect to whichever daily is current. The helper resolves it via `curl -Ls -o /dev/null -w '%{url_effective}'` and uses the resulting `https://.../` base.
 - Per-cluster kubeconfigs land in `/workspaces/.kube/configs/<acp-slug>--<cluster>.yaml`, each stamped `# generated-by: acp-kubeconfig-sync` so re-runs only overwrite our own files.
-- Default user `admin@cpaas.io` / password `07Apples@` (standard daily admin, baked into the Python script). Tokens last ~24h, hence "daily" — rerun when they expire.
+- Credentials come from `$ACP_DEFAULT_USER` and `$ACP_DEFAULT_PASS` (also in `devpod.env`). Override per-call with `-u/-p`. Tokens last ~24h — rerun when they expire.
 - The script is Python 3 stdlib + `openssl` (RSA-PKCS1 encrypt) — both present in devpod.
-- Distinct from Edge cluster access above: **edge** = `business-build` cluster, long-lived (~3 yr) token, manually-pinned kubeconfig. **daily** = rotating ACP, short-lived (~24 h) token, auto-resolved + auto-synced via this helper. Don't mix them.
+- Distinct from Edge cluster access above: **edge** = long-lived manually-pinned kubeconfig. **daily** = rotating ACP, short-lived (~24 h) token, auto-resolved + auto-synced via this helper. Don't mix them.
 
-If the helper reports "❌ resolve daily-devops.alaudatech.net 失败" or "❌ /dex/pubkey 不通", that's an infra signal (entry point down / daily mid-rotation) — surface it to the user, do not invent fallbacks.
+If the helper reports "❌ resolve … failed" or "❌ /dex/pubkey unreachable", that's an infra signal (entry point down / daily mid-rotation) — surface it to the user, do not invent fallbacks.
+
+## Where the addresses / credentials actually live
+
+This file deliberately contains **no hostnames, no credentials, no internal infra details**. Those are kept in `/workspaces/.claude/devpod.env` (sourced by `~/.bashrc`, not committed). Template at `.devcontainer/files/devpod.env.example`. If a tool here references `$ACP_DAILY_ENTRY` or `$ACP_DEFAULT_USER`, those resolve to whatever the user set there.
