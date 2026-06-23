@@ -53,8 +53,9 @@ jobs:
           test -x /workspaces/.local/bin/acp-kubeconfig-sync
           test -d /workspaces/.kube/configs
           test -d /workspaces/claude-discord-multisession/.git
-          # plugin checkout pinned to the patch base; patch must have applied
-          test "$(git -C /workspaces/claude-discord-multisession status --porcelain | wc -l)" -gt 0
+          # plugin checkout pinned to the patch base; patch must have applied.
+          # Run git as vscode (the dir's owner) so it doesn't trip 'dubious ownership'.
+          test "$(sudo -u vscode -H git -C /workspaces/claude-discord-multisession status --porcelain | wc -l)" -gt 0
           test -f /workspaces/.claude/CLAUDE.md
           test -f /workspaces/.claude/devpod.env
           # bashrc managed block exists exactly once
