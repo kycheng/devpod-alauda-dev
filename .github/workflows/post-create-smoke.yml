@@ -1,0 +1,111 @@
+name: post-create smoke test
+
+on:
+  pull_request:
+    paths:
+      - '.devcontainer/**'
+      - '.github/workflows/post-create-smoke.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base container image (defaults to vars.CI_BASE_IMAGE or mcr.microsoft.com/devcontainers/go:1.24)'
+        required: false
+        type: string
+        default: ''
+
+# Resolution order for the container image:
+#   1. workflow_dispatch input `base_image` (manual override)
+#   2. repository variable `CI_BASE_IMAGE` (set under Settings → Variables → Actions
+#      to e.g. an internal build-harbor.alauda.cn tag)
+#   3. public Microsoft devcontainers Go 1.24 image as a sane default
+# If you set CI_BASE_IMAGE to a private registry, also configure secrets
+# CI_REGISTRY_USER and CI_REGISTRY_PASS and uncomment the credentials block below.
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.base_image || vars.CI_BASE_IMAGE || 'mcr.microsoft.com/devcontainers/go:1.24' }}
+      # credentials:
+      #   username: ${{ secrets.CI_REGISTRY_USER }}
+      #   password: ${{ secrets.CI_REGISTRY_PASS }}
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: report image used
+        run: |
+          echo "container image: ${{ inputs.base_image || vars.CI_BASE_IMAGE || 'mcr.microsoft.com/devcontainers/go:1.24' }}"
+          uname -a
+          (. /etc/os-release && echo "$PRETTY_NAME") || true
+          /usr/local/go/bin/go version 2>/dev/null || echo "Go: not present in image (will be installed by post-create.sh)"
+
+      - name: prep environment to mimic a fresh devpod
+        run: |
+          # post-create.sh expects /workspaces to exist and be writable by the
+          # running user; on GH runners we get a fresh /workspaces and run as root.
+          mkdir -p /workspaces
+          # Mirror the bashrc the live devpod expects to find.
+          touch /workspaces/.bashrc
+          # post-create.sh runs `sudo` for a few things; install it if absent
+          # in the base image (devcontainers go image already has it; safety net).
+          command -v sudo >/dev/null || (apt-get update && apt-get install -y sudo)
+          # Run as a non-root vscode-like user, matching real conditions.
+          id vscode || useradd -m -s /bin/bash vscode
+          echo 'vscode ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/vscode
+          chown -R vscode:vscode /workspaces "$GITHUB_WORKSPACE"
+
+      - name: cold run — first invocation of post-create.sh
+        run: |
+          sudo -u vscode -H bash -lc "cd '$GITHUB_WORKSPACE' && bash .devcontainer/post-create.sh" \
+            | tee /tmp/cold.log
+
+      - name: assertions after cold run
+        run: |
+          set -eux
+          /usr/local/go/bin/go version | grep -F 'go1.26.4'
+          test -x /workspaces/bin/zellij
+          /workspaces/bin/zellij --version | grep -F '0.44.3'
+          test -x /workspaces/.local/bin/kubectl
+          # code-server install path varies (standalone vs distro pkg); just check it's somewhere on PATH
+          sudo -u vscode -H bash -lc 'command -v code-server'
+          # claude installs under HOME=/workspaces when post-create sets that
+          sudo -u vscode -H bash -lc 'command -v claude || test -x /workspaces/.local/bin/claude'
+          test -x /workspaces/.local/bin/acp-kubeconfig-sync
+          test -d /workspaces/.kube/configs
+          test -d /workspaces/claude-discord-multisession/.git
+          # plugin checkout pinned to the patch base; patch must have applied.
+          # Run git as vscode (the dir's owner) so it doesn't trip 'dubious ownership'.
+          test "$(sudo -u vscode -H git -C /workspaces/claude-discord-multisession status --porcelain | wc -l)" -gt 0
+          test -f /workspaces/.claude/CLAUDE.md
+          test -f /workspaces/.claude/devpod.env
+          # bashrc managed block exists exactly once
+          test "$(grep -c '^# --- BEGIN devpod-alauda-dev managed' /workspaces/.bashrc)" -eq 1
+          # CLAUDE.md template content present
+          grep -q 'Mac access' /workspaces/.claude/CLAUDE.md
+          # acp-kubeconfig-sync no longer carries hardcoded credentials
+          ! grep -E '07Apples@|admin@cpaas\.io' /workspaces/.local/bin/acp-kubeconfig-sync
+          # bashrc.append does not embed internal hostnames
+          ! grep -E 'daily-devops\.alaudatech\.net|edge\.alauda\.cn' /workspaces/.bashrc
+
+      - name: marker file to verify CLAUDE.md is not overwritten on re-run
+        run: |
+          sudo -u vscode -H bash -c 'echo "<!-- USER MARKER -->" >> /workspaces/.claude/CLAUDE.md'
+
+      - name: warm run — second invocation must be idempotent
+        run: |
+          sudo -u vscode -H bash -lc "cd '$GITHUB_WORKSPACE' && bash .devcontainer/post-create.sh" \
+            | tee /tmp/warm.log
+
+      - name: assertions after warm run
+        run: |
+          set -eux
+          # marker survived (CLAUDE.md not overwritten)
+          grep -q 'USER MARKER' /workspaces/.claude/CLAUDE.md
+          # managed block still exactly once (refresh, not duplicate)
+          test "$(grep -c '^# --- BEGIN devpod-alauda-dev managed' /workspaces/.bashrc)" -eq 1
+          # Go didn't re-download (warm log says "already installed, skipping")
+          grep -q 'Go go1.26.4 already installed, skipping' /tmp/warm.log
+          # zellij didn't re-download
+          grep -q 'zellij already installed, skipping' /tmp/warm.log
