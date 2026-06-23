@@ -46,10 +46,15 @@ jobs:
           test -x /workspaces/bin/zellij
           /workspaces/bin/zellij --version | grep -F '0.44.3'
           test -x /workspaces/.local/bin/kubectl
-          test -x /workspaces/.local/bin/code-server
+          # code-server install path varies (standalone vs distro pkg); just check it's somewhere on PATH
+          sudo -u vscode -H bash -lc 'command -v code-server'
+          # claude installs under HOME=/workspaces when post-create sets that
+          sudo -u vscode -H bash -lc 'command -v claude || test -x /workspaces/.local/bin/claude'
           test -x /workspaces/.local/bin/acp-kubeconfig-sync
           test -d /workspaces/.kube/configs
           test -d /workspaces/claude-discord-multisession/.git
+          # plugin checkout pinned to the patch base; patch must have applied
+          test "$(git -C /workspaces/claude-discord-multisession status --porcelain | wc -l)" -gt 0
           test -f /workspaces/.claude/CLAUDE.md
           test -f /workspaces/.claude/devpod.env
           # bashrc managed block exists exactly once

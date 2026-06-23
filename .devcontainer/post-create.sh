@@ -105,17 +105,24 @@ if [ ! -f "$HOME/.config/zellij/config.kdl" ] && [ -f "$FILES_DIR/zellij/config.
 fi
 
 # --- claude-discord-multisession (clone upstream + apply local patch) ------
+# Pin to the commit that files/claude-discord-multisession.patch was generated
+# against so the patch always applies cleanly. Refresh both when you rebase.
 PLUGIN_DIR=/workspaces/claude-discord-multisession
+PLUGIN_COMMIT=16e9d16
 if [ ! -d "$PLUGIN_DIR/.git" ]; then
-  echo "Cloning claude-discord-multisession..."
+  echo "Cloning claude-discord-multisession (pinned to $PLUGIN_COMMIT)..."
   retry 3 5 git clone https://github.com/danielfbm/claude-discord-multisession.git "$PLUGIN_DIR"
-  if [ -d "$PLUGIN_DIR/.git" ] && [ -f "$FILES_DIR/claude-discord-multisession.patch" ]; then
-    echo "Applying claude-discord-multisession.patch..."
-    if git -C "$PLUGIN_DIR" apply --check "$FILES_DIR/claude-discord-multisession.patch" 2>/dev/null; then
-      git -C "$PLUGIN_DIR" apply "$FILES_DIR/claude-discord-multisession.patch"
-    else
-      echo "  Patch no longer applies cleanly to upstream HEAD — leaving plugin at upstream HEAD."
-      echo "  Refresh files/claude-discord-multisession.patch and re-run, or pin a known-good upstream commit."
+  if [ -d "$PLUGIN_DIR/.git" ]; then
+    git -C "$PLUGIN_DIR" checkout "$PLUGIN_COMMIT" 2>&1 | tail -2
+    if [ -f "$FILES_DIR/claude-discord-multisession.patch" ]; then
+      echo "Applying claude-discord-multisession.patch..."
+      if git -C "$PLUGIN_DIR" apply --check "$FILES_DIR/claude-discord-multisession.patch" 2>/dev/null; then
+        git -C "$PLUGIN_DIR" apply "$FILES_DIR/claude-discord-multisession.patch"
+        echo "  Patch applied."
+      else
+        echo "  ERROR: patch does not apply at pinned commit $PLUGIN_COMMIT — refresh files/claude-discord-multisession.patch."
+        exit 1
+      fi
     fi
   fi
 else
