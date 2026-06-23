@@ -63,7 +63,15 @@ After editing, `source /workspaces/.claude/devpod.env` (or open a new shell) and
 
 ## Tests
 
-`.github/workflows/post-create-smoke.yml` runs on every PR touching `.devcontainer/**`. It spins up the public `mcr.microsoft.com/devcontainers/go:1.24` image as a stand-in for the private `build-harbor.alauda.cn/devcontainers/go:1.24` base, runs `post-create.sh` cold, asserts the expected components are present, then re-runs to verify idempotency (managed bashrc block stays at exactly one occurrence, CLAUDE.md not overwritten, Go not re-downloaded).
+`.github/workflows/post-create-smoke.yml` runs on every PR touching `.devcontainer/**`. It spins up a container, runs `post-create.sh` cold, asserts the expected components are present, then re-runs to verify idempotency (managed bashrc block stays at exactly one occurrence, CLAUDE.md not overwritten, Go not re-downloaded).
+
+**Container image** is resolved in this order:
+
+1. `workflow_dispatch` input `base_image` — manual override when re-running from the Actions UI.
+2. Repo variable `CI_BASE_IMAGE` — set under Settings → Variables → Actions (e.g. to an internal `build-harbor.alauda.cn/devcontainers/go:1.24` tag).
+3. Default `mcr.microsoft.com/devcontainers/go:1.24` — public stand-in for the private harbor base.
+
+For a private registry, also set secrets `CI_REGISTRY_USER` / `CI_REGISTRY_PASS` and uncomment the `credentials:` block in the workflow.
 
 ## Usage
 

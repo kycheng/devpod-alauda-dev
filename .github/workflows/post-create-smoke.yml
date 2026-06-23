@@ -7,17 +7,39 @@ on:
       - '.github/workflows/post-create-smoke.yml'
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: 'Base container image (defaults to vars.CI_BASE_IMAGE or mcr.microsoft.com/devcontainers/go:1.24)'
+        required: false
+        type: string
+        default: ''
 
+# Resolution order for the container image:
+#   1. workflow_dispatch input `base_image` (manual override)
+#   2. repository variable `CI_BASE_IMAGE` (set under Settings → Variables → Actions
+#      to e.g. an internal build-harbor.alauda.cn tag)
+#   3. public Microsoft devcontainers Go 1.24 image as a sane default
+# If you set CI_BASE_IMAGE to a private registry, also configure secrets
+# CI_REGISTRY_USER and CI_REGISTRY_PASS and uncomment the credentials block below.
 jobs:
   smoke:
     runs-on: ubuntu-latest
     container:
-      # Public stand-in for the private build-harbor.alauda.cn/devcontainers/go:1.24 base.
-      # Same Debian-based devcontainers feature set; covers the install paths in post-create.sh.
-      image: mcr.microsoft.com/devcontainers/go:1.24
+      image: ${{ inputs.base_image || vars.CI_BASE_IMAGE || 'mcr.microsoft.com/devcontainers/go:1.24' }}
+      # credentials:
+      #   username: ${{ secrets.CI_REGISTRY_USER }}
+      #   password: ${{ secrets.CI_REGISTRY_PASS }}
       options: --user root
     steps:
       - uses: actions/checkout@v4
+
+      - name: report image used
+        run: |
+          echo "container image: ${{ inputs.base_image || vars.CI_BASE_IMAGE || 'mcr.microsoft.com/devcontainers/go:1.24' }}"
+          uname -a
+          (. /etc/os-release && echo "$PRETTY_NAME") || true
+          /usr/local/go/bin/go version 2>/dev/null || echo "Go: not present in image (will be installed by post-create.sh)"
 
       - name: prep environment to mimic a fresh devpod
         run: |
