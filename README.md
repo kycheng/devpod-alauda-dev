@@ -16,6 +16,9 @@ The repo is intentionally free of internal hostnames and credentials — those c
 | zellij 0.44.3 | `/workspaces/bin/zellij` | Plus user config seeded from `.devcontainer/files/zellij/config.kdl` (never overwritten). |
 | claude-discord-multisession | `/workspaces/claude-discord-multisession` | Cloned from upstream `github.com/danielfbm/claude-discord-multisession`, with local patches from `.devcontainer/files/claude-discord-multisession.patch` applied. |
 | acp-kubeconfig-sync | `/workspaces/.local/bin/acp-kubeconfig-sync` | ACP login + per-cluster kubeconfig sync, used by the `acp-sync-daily` helper. |
+| Node.js LTS | nvm-managed (image's `/usr/local/share/nvm/`) | Required by the Claude Code skills below; install is skipped if `current/bin/node` already resolves. |
+| `humanizer-zh` skill | `~/.agents/skills/humanizer-zh` (symlinked into `/workspaces/.claude/skills/`) | 中文「去 AI 味」skill from `ai-zixun/humanizer-zh`. Installed via `npx skills add … -g`. |
+| `claude-mem` plugin | `/workspaces/.claude/plugins/cache/thedotmack/claude-mem/` + state at `/workspaces/.claude-mem` (symlinked from `~/.claude-mem`) | Cross-session memory plugin from `thedotmack/claude-mem`. Installed via `npx claude-mem install --provider claude --no-auto-start`. |
 
 ## Shell helpers
 
