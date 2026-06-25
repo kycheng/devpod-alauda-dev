@@ -88,6 +88,16 @@ jobs:
           ! grep -E '07Apples@|admin@cpaas\.io' /workspaces/.local/bin/acp-kubeconfig-sync
           # bashrc.append does not embed internal hostnames
           ! grep -E 'daily-devops\.alaudatech\.net|edge\.alauda\.cn' /workspaces/.bashrc
+          # Node LTS available via nvm's `current` symlink
+          test -x /usr/local/share/nvm/current/bin/node
+          # humanizer-zh skill installed and surfaced into the Claude Code config dir
+          test -f /home/vscode/.agents/skills/humanizer-zh/SKILL.md
+          test -L /workspaces/.claude/skills/humanizer-zh
+          # claude-mem plugin registered against its marketplace
+          grep -q '"claude-mem@thedotmack"' /workspaces/.claude/plugins/installed_plugins.json
+          # claude-mem state lives on persistent /workspaces, with ~ pointing into it
+          test -L /home/vscode/.claude-mem
+          test "$(readlink /home/vscode/.claude-mem)" = '/workspaces/.claude-mem'
 
       - name: marker file to verify CLAUDE.md is not overwritten on re-run
         run: |
@@ -109,3 +119,6 @@ jobs:
           grep -q 'Go go1.26.4 already installed, skipping' /tmp/warm.log
           # zellij didn't re-download
           grep -q 'zellij already installed, skipping' /tmp/warm.log
+          # skills + plugins didn't reinstall on the warm run
+          grep -q 'humanizer-zh already installed, skipping' /tmp/warm.log
+          grep -q 'claude-mem already installed, skipping' /tmp/warm.log

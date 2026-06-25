@@ -176,4 +176,50 @@ elif [ -f "$CLAUDE_MD" ]; then
   echo "$CLAUDE_MD already exists, leaving it alone (manual merge if you want template updates: diff with $FILES_DIR/CLAUDE.md.template)"
 fi
 
+# --- Claude Code skills / plugins ------------------------------------------
+CLAUDE_CFG=/workspaces/.claude
+mkdir -p "$CLAUDE_CFG/skills" "$CLAUDE_CFG/plugins"
+
+# claude-mem persists conversation memories under ~/.claude-mem; relocate it
+# onto /workspaces so it survives container rebuilds.
+CLAUDE_MEM_HOME=/workspaces/.claude-mem
+mkdir -p "$CLAUDE_MEM_HOME"
+if [ ! -L "$HOME/.claude-mem" ]; then
+  if [ -d "$HOME/.claude-mem" ]; then
+    cp -an "$HOME/.claude-mem/." "$CLAUDE_MEM_HOME/" 2>/dev/null || true
+    rm -rf "$HOME/.claude-mem"
+  fi
+  ln -s "$CLAUDE_MEM_HOME" "$HOME/.claude-mem"
+  echo "Linked $HOME/.claude-mem -> $CLAUDE_MEM_HOME"
+fi
+
+# Node LTS via the base image's nvm (skills/plugins below shell out to npx).
+if [ -s /usr/local/share/nvm/nvm.sh ] && [ ! -x /usr/local/share/nvm/current/bin/node ]; then
+  echo "Installing Node LTS via nvm..."
+  # shellcheck disable=SC1091
+  source /usr/local/share/nvm/nvm.sh
+  retry 3 5 nvm install --lts
+  nvm alias default 'lts/*' >/dev/null
+fi
+[ -x /usr/local/share/nvm/current/bin/node ] && PATH="/usr/local/share/nvm/current/bin:$PATH"
+export PATH
+
+# humanizer-zh: 中文「去 AI 味」skill. The `skills` CLI symlinks it into
+# $CLAUDE_CFG/skills/ for us.
+if [ ! -f "$HOME/.agents/skills/humanizer-zh/SKILL.md" ]; then
+  echo "Installing humanizer-zh skill..."
+  retry 3 5 npx -y skills add ai-zixun/humanizer-zh -g
+else
+  echo "humanizer-zh already installed, skipping"
+fi
+
+# claude-mem: persistent conversation memory plugin. The installer registers
+# a marketplace entry + plugin in $CLAUDE_CFG/plugins.
+if ! grep -q '"claude-mem@thedotmack"' "$CLAUDE_CFG/plugins/installed_plugins.json" 2>/dev/null; then
+  echo "Installing claude-mem..."
+  retry 3 5 npx -y claude-mem install --provider claude --no-auto-start
+else
+  echo "claude-mem already installed, skipping"
+fi
+
 echo "=== Setup Complete ==="
