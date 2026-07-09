@@ -110,8 +110,24 @@ confirm_plugin() {
   [ "$sent" = 1 ]
 }
 
-# Snapshot running sessions once so the loop stays cheap.
-running=$(env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" list-sessions --no-formatting 2>/dev/null | awk '{print $1}')
+# Snapshot sessions once so the loop stays cheap. Track alive and EXITED
+# separately — a session that exited (Claude crashed / dev-channels prompt
+# rejected / plugin failed) is still listed by `zellij list-sessions` with
+# an "(EXITED - attach to resurrect)" marker. Treating it as "already
+# running" leaves the user with a dead pane; we want to force-clean it
+# and relaunch instead.
+sessions_raw=$(env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" list-sessions --no-formatting 2>/dev/null)
+running_alive=$(printf '%s\n' "$sessions_raw" | grep -v 'EXITED' | awk '{print $1}')
+running_exited=$(printf '%s\n' "$sessions_raw" | grep 'EXITED' | awk '{print $1}')
+
+# zellij sometimes leaves an EXITED session behind that a single
+# `delete-session --force` does not fully clean. Two-step it: kill-session
+# (no-op if already dead) then delete-session --force. Safe to call on a
+# missing name — both commands print an informational line and return 0.
+purge_zellij_session() {
+  env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" kill-session "$1" >/dev/null 2>&1 || true
+  env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" delete-session --force "$1" >/dev/null 2>&1 || true
+}
 
 restore_one() {
   local sid=$1 cwd=$2 thread=$3
@@ -121,11 +137,19 @@ restore_one() {
   if [ ! -d "$cwd" ]; then
     printf '  ⏭  %s  cwd missing: %s\n' "$sid" "$cwd"; return
   fi
-  # Already running?
-  if printf '%s\n' "$running" | grep -qE -- "-${sid}\$"; then
+  # Already alive?
+  if printf '%s\n' "$running_alive" | grep -qE -- "-${sid}\$"; then
     local existing
-    existing=$(printf '%s\n' "$running" | grep -E -- "-${sid}\$" | head -1)
+    existing=$(printf '%s\n' "$running_alive" | grep -E -- "-${sid}\$" | head -1)
     printf '  ✓  %s  already running: %s\n' "$sid" "$existing"; return
+  fi
+  # An EXITED shell of the same sid? Clean it out before relaunching so
+  # zellij accepts the new session name.
+  if printf '%s\n' "$running_exited" | grep -qE -- "-${sid}\$"; then
+    local dead
+    dead=$(printf '%s\n' "$running_exited" | grep -E -- "-${sid}\$" | head -1)
+    printf '  🧹 %s  purging EXITED session %s\n' "$sid" "$dead"
+    purge_zellij_session "$dead"
   fi
 
   # Compute display name: repo basename if inside a git working tree,
