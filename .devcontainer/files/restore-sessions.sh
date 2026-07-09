@@ -73,26 +73,38 @@ in_only() {
 # Enter on the highlighted option, then detach. Walks up to 4 panes because
 # the launch flow leaves an idle default shell pane focused; the Claude pane
 # is somewhere else.
+#
+# Delivery quirks (learned the hard way):
+# - Claude Code's Ink UI reads raw CR ('\r'), not LF ('\n'). Sending '\n'
+#   silently no-ops the confirmation.
+# - `action send-keys` is for named key sequences and re-encodes bytes;
+#   `action write-chars` writes the literal bytes we want to the pane's
+#   stdin. Only `write-chars` reaches Ink.
+# - Verify by re-dumping after the write. If the sentinel is still there,
+#   the pane focus was wrong; cycle and try again.
 confirm_plugin() {
   local session=$1 pidfile dump cpid sent=0
   pidfile=$(mktemp); dump=$(mktemp)
   SHELL=/bin/bash setsid script -qfc \
     "bash -c 'echo \$\$ > $pidfile; exec env -u ZELLIJ -u ZELLIJ_SESSION_NAME $ZELLIJ attach $session'" \
     /dev/null >/dev/null 2>&1 &
-  sleep 2
+  sleep 3
   cpid=$(cat "$pidfile" 2>/dev/null)
   for _ in 1 2 3 4; do
     env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action dump-screen --path "$dump" 2>/dev/null
     # Match on the plugin identifier + footer — neither wraps across lines.
     if grep -q 'plugin:discord@danielfbm-discord' "$dump" 2>/dev/null && \
        grep -q 'Enter to confirm' "$dump" 2>/dev/null; then
-      env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action send-keys $'\n' 2>/dev/null
-      sent=1; break
+      env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action write-chars $'\r' 2>/dev/null
+      sleep 2
+      env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action dump-screen --path "$dump" 2>/dev/null
+      if ! grep -q 'Enter to confirm' "$dump" 2>/dev/null; then
+        sent=1; break
+      fi
     fi
     env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action focus-next-pane 2>/dev/null
     sleep 0.3
   done
-  sleep 1
   [ -n "$cpid" ] && kill -TERM -"$cpid" 2>/dev/null
   rm -f "$pidfile" "$dump"
   [ "$sent" = 1 ]
