@@ -147,8 +147,28 @@ elif [ -f "$DEVPOD_ENV" ]; then
   echo "$DEVPOD_ENV already exists, leaving it alone"
 fi
 
-# --- bashrc helpers (sentinel-guarded, idempotent) -------------------------
+# --- bashrc base (self-heal if the standard devcontainer prompt is missing) --
+# The base image sometimes re-seeds /workspaces/.bashrc as a minimal stub on
+# rebuild, losing the standard Debian bashrc header, LANG/PATH exports, and
+# the __bash_prompt-based colored prompt with git branch. Detect that state
+# and prepend our template so the interactive shell always has the expected
+# color scheme and PATH. We key off __bash_prompt because it is unique to the
+# devcontainer prompt block and unlikely to appear anywhere a user would add.
 BASHRC=/workspaces/.bashrc
+if [ -f "$FILES_DIR/bashrc.template" ]; then
+  if [ ! -f "$BASHRC" ]; then
+    echo "Seeding $BASHRC from bashrc.template..."
+    mkdir -p "$(dirname "$BASHRC")"
+    cp "$FILES_DIR/bashrc.template" "$BASHRC"
+  elif ! grep -q '__bash_prompt' "$BASHRC"; then
+    echo "$BASHRC missing __bash_prompt — prepending bashrc.template..."
+    cat "$FILES_DIR/bashrc.template" "$BASHRC" > "$BASHRC.tmp" && mv "$BASHRC.tmp" "$BASHRC"
+  else
+    echo "$BASHRC prompt intact, skipping template"
+  fi
+fi
+
+# --- bashrc helpers (sentinel-guarded, idempotent) -------------------------
 if [ -f "$BASHRC" ] && [ -f "$FILES_DIR/bashrc.append" ]; then
   if ! grep -q '# --- BEGIN devpod-alauda-dev managed' "$BASHRC"; then
     echo "Appending managed block to $BASHRC..."
