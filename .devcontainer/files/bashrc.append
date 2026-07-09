@@ -10,6 +10,12 @@
 mac() { ssh mac "$@"; }
 alias cc=/workspaces/.local/bin/claude
 
+# Zellij session shortcuts.
+alias zj='zellij'
+alias zjl='zellij ls'
+alias zjk='zellij kill-session'
+zjs() { zellij attach "$1" 2>/dev/null || zellij -s "$1"; }
+
 # Daily ACP kubeconfig sync.
 # Resolves the current daily URL via the stable redirect $ACP_DAILY_ENTRY,
 # then drops one kubeconfig per matched cluster into /workspaces/.kube/configs/.
