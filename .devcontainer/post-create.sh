@@ -136,6 +136,16 @@ if [ -f "$FILES_DIR/acp-kubeconfig-sync" ]; then
   echo "acp-kubeconfig-sync installed at /workspaces/.local/bin/acp-kubeconfig-sync"
 fi
 
+# --- restore-sessions ------------------------------------------------------
+# Relaunches claude-discord-multisession zellij sessions from bindings.json
+# after a devpod restart, and confirms the plugin channel prompt so Claude
+# actually finishes loading.
+if [ -f "$FILES_DIR/restore-sessions.sh" ]; then
+  mkdir -p /workspaces/.local/bin
+  install -m 755 "$FILES_DIR/restore-sessions.sh" /workspaces/.local/bin/restore-sessions
+  echo "restore-sessions installed at /workspaces/.local/bin/restore-sessions"
+fi
+
 # --- devpod.env (seed example if absent; never overwrite the live file) ----
 DEVPOD_ENV=/workspaces/.claude/devpod.env
 if [ ! -f "$DEVPOD_ENV" ] && [ -f "$FILES_DIR/devpod.env.example" ]; then
