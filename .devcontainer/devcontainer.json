@@ -5,6 +5,7 @@
   "containerEnv": {
     "VSCODE_AGENT_FOLDER": "/workspaces/.vscode-server",
     "CLAUDE_CONFIG_DIR": "/workspaces/.claude",
+    "CODEX_HOME": "/workspaces/.codex",
     "KUBECONFIG": "/workspaces/.kube/config",
     "GOPATH": "/workspaces/.go",
     "GOMODCACHE": "/workspaces/.go/pkg/mod",

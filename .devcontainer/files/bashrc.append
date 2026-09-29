@@ -9,6 +9,8 @@
 # Then `ssh mac` (the alias is in ~/.ssh/config) resolves to localhost:2223.
 mac() { ssh mac "$@"; }
 alias cc=/workspaces/.local/bin/claude
+# Codex config/login persisted across rebuilds (also set in devcontainer.json).
+export CODEX_HOME=${CODEX_HOME:-/workspaces/.codex}
 
 # SOCKS5 network bridge through a jump host (network path only, no file
 # sync / storage use). Set BRIDGE_HOST (an ssh host/alias) in devpod.env.
