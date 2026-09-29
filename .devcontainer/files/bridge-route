@@ -1,0 +1,79 @@
+#!/bin/bash
+# Manage which hosts route through the $BRIDGE_HOST SOCKS5 bridge
+# (see `bridge-up` in bashrc.append). Maintains a plain host list at
+# $BRIDGE_HOSTS_FILE and keeps git's per-host http.<url>.proxy config
+# in sync with it, so `git` automatically tunnels only the hosts you've
+# added here. `bridge-curl` (bashrc.append) consults the same file to
+# decide per-request whether to add --socks5-hostname.
+#
+# Usage:
+#   bridge-route add <host>[:port]
+#   bridge-route rm  <host>[:port]
+#   bridge-route list
+#   bridge-route sync   # reapply git config for every host in the file
+
+set -euo pipefail
+
+BRIDGE_HOSTS_FILE=${BRIDGE_HOSTS_FILE:-/workspaces/.claude/bridge-hosts.conf}
+BRIDGE_PROXY_URL=${BRIDGE_PROXY_URL:-socks5h://localhost:1080}
+
+mkdir -p "$(dirname "$BRIDGE_HOSTS_FILE")"
+touch "$BRIDGE_HOSTS_FILE"
+
+git_proxy_set() {
+  local host=$1
+  git config --global "http.https://${host}/.proxy" "$BRIDGE_PROXY_URL"
+  git config --global "http.http://${host}/.proxy" "$BRIDGE_PROXY_URL"
+}
+
+git_proxy_unset() {
+  local host=$1
+  git config --global --unset "http.https://${host}/.proxy" 2>/dev/null || true
+  git config --global --unset "http.http://${host}/.proxy" 2>/dev/null || true
+}
+
+cmd_add() {
+  local host=${1:?usage: bridge-route add <host>[:port]}
+  if grep -qxF "$host" "$BRIDGE_HOSTS_FILE"; then
+    echo "already routed: $host"
+  else
+    echo "$host" >> "$BRIDGE_HOSTS_FILE"
+    sort -uo "$BRIDGE_HOSTS_FILE" "$BRIDGE_HOSTS_FILE"
+    echo "added: $host"
+  fi
+  git_proxy_set "$host"
+}
+
+cmd_rm() {
+  local host=${1:?usage: bridge-route rm <host>[:port]}
+  grep -vxF "$host" "$BRIDGE_HOSTS_FILE" > "$BRIDGE_HOSTS_FILE.tmp" || true
+  mv "$BRIDGE_HOSTS_FILE.tmp" "$BRIDGE_HOSTS_FILE"
+  git_proxy_unset "$host"
+  echo "removed: $host"
+}
+
+cmd_list() {
+  if [ ! -s "$BRIDGE_HOSTS_FILE" ]; then
+    echo "(no hosts routed — bridge-route add <host>)"
+    return
+  fi
+  nl -ba "$BRIDGE_HOSTS_FILE"
+}
+
+cmd_sync() {
+  while IFS= read -r host; do
+    [ -n "$host" ] && git_proxy_set "$host"
+  done < "$BRIDGE_HOSTS_FILE"
+  echo "synced $(wc -l < "$BRIDGE_HOSTS_FILE") host(s) to git config"
+}
+
+case "${1:-}" in
+  add)  shift; cmd_add "$@" ;;
+  rm)   shift; cmd_rm "$@" ;;
+  list) cmd_list ;;
+  sync) cmd_sync ;;
+  *)
+    echo "usage: bridge-route {add|rm|list|sync} [host]" >&2
+    exit 2
+    ;;
+esac

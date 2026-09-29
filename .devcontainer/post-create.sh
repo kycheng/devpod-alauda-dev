@@ -136,6 +136,15 @@ if [ -f "$FILES_DIR/acp-kubeconfig-sync" ]; then
   echo "acp-kubeconfig-sync installed at /workspaces/.local/bin/acp-kubeconfig-sync"
 fi
 
+# --- bridge-route ------------------------------------------------------------
+# Manages which hosts auto-route through the $BRIDGE_HOST SOCKS5 bridge
+# (bridge-up in bashrc.append): bridge-route {add|rm|list|sync} <host>.
+if [ -f "$FILES_DIR/bridge-route" ]; then
+  mkdir -p /workspaces/.local/bin
+  install -m 755 "$FILES_DIR/bridge-route" /workspaces/.local/bin/bridge-route
+  echo "bridge-route installed at /workspaces/.local/bin/bridge-route"
+fi
+
 # --- devpod.env (seed example if absent; never overwrite the live file) ----
 DEVPOD_ENV=/workspaces/.claude/devpod.env
 if [ ! -f "$DEVPOD_ENV" ] && [ -f "$FILES_DIR/devpod.env.example" ]; then
