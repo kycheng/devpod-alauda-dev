@@ -9,6 +9,94 @@
 # Then `ssh mac` (the alias is in ~/.ssh/config) resolves to localhost:2223.
 mac() { ssh mac "$@"; }
 alias cc=/workspaces/.local/bin/claude
+# Codex config/login persisted across rebuilds (also set in devcontainer.json).
+export CODEX_HOME=${CODEX_HOME:-/workspaces/.codex}
+
+# SOCKS5 network bridge through a jump host (network path only, no file
+# sync / storage use). Set BRIDGE_HOST (an ssh host/alias) in devpod.env.
+# A background supervisor loop keeps one ssh -D master alive: ServerAlive
+# probes make a stalled link exit within ~45s (instead of hanging until the
+# 2h kernel keepalive), and the loop reconnects it.
+BRIDGE_HOST=${BRIDGE_HOST:-}
+BRIDGE_PORT=${BRIDGE_PORT:-1080}
+BRIDGE_SOCK=/tmp/ssh-bridge-${BRIDGE_HOST}.sock
+BRIDGE_PIDFILE=/tmp/ssh-bridge-${BRIDGE_HOST}.pid
+BRIDGE_LOG=/tmp/ssh-bridge-${BRIDGE_HOST}.log
+_bridge_supervisor_alive() {
+  [ -f "$BRIDGE_PIDFILE" ] && kill -0 "$(cat "$BRIDGE_PIDFILE")" 2>/dev/null
+}
+_bridge_host_set() {
+  [ -n "$BRIDGE_HOST" ] || { echo "BRIDGE_HOST not set — add it to /workspaces/.claude/devpod.env" >&2; return 1; }
+}
+bridge-up() {
+  _bridge_host_set || return 1
+  if _bridge_supervisor_alive; then
+    echo "bridge already up: SOCKS5 on localhost:${BRIDGE_PORT} (supervisor pid $(cat "$BRIDGE_PIDFILE"))"; return 0
+  fi
+  # Unsupervised master left over from an older bridge-up: replace it.
+  ssh -S "$BRIDGE_SOCK" -O exit "$BRIDGE_HOST" >/dev/null 2>&1
+  # Subshell: no job-control notice, and setsid execs in place so $! is the
+  # session leader bridge-down kills as a group.
+  ( nohup setsid bash -c '
+    while :; do
+      rm -f "$0"
+      echo "$(date "+%F %T") connecting"
+      ssh -N -M -S "$0" -D "$1" \
+        -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+        -o ExitOnForwardFailure=yes -o ConnectTimeout=15 -o BatchMode=yes "$2"
+      rc=$?
+      echo "$(date "+%F %T") ssh exited rc=$rc, reconnecting in 5s"
+      sleep 5
+    done' "$BRIDGE_SOCK" "$BRIDGE_PORT" "$BRIDGE_HOST" >>"$BRIDGE_LOG" 2>&1 </dev/null &
+    echo $! >"$BRIDGE_PIDFILE" )
+  local i
+  for i in $(seq 1 20); do
+    ssh -S "$BRIDGE_SOCK" -O check "$BRIDGE_HOST" >/dev/null 2>&1 && {
+      echo "bridge up: SOCKS5 on localhost:${BRIDGE_PORT} via ${BRIDGE_HOST} (supervised, log ${BRIDGE_LOG})"; return 0; }
+    sleep 0.5
+  done
+  echo "bridge supervisor started but ssh not connected yet; see ${BRIDGE_LOG}"; return 1
+}
+bridge-down() {
+  _bridge_host_set || return 1
+  local was=
+  if _bridge_supervisor_alive; then
+    kill -- -"$(cat "$BRIDGE_PIDFILE")" 2>/dev/null || kill "$(cat "$BRIDGE_PIDFILE")"; was=1
+  fi
+  rm -f "$BRIDGE_PIDFILE"
+  ssh -S "$BRIDGE_SOCK" -O exit "$BRIDGE_HOST" >/dev/null 2>&1 && was=1
+  [ -n "$was" ] && echo "bridge down" || echo "bridge was not up"
+}
+bridge-status() {
+  _bridge_host_set || return 1
+  if _bridge_supervisor_alive; then echo "supervisor running (pid $(cat "$BRIDGE_PIDFILE"))"
+  else echo "supervisor NOT running (bridge-up to start)"; fi
+  ssh -S "$BRIDGE_SOCK" -O check "$BRIDGE_HOST" 2>&1
+  tail -n 3 "$BRIDGE_LOG" 2>/dev/null
+}
+# Manage which hosts auto-route through the bridge: bridge-route {add|rm|list|sync} <host>
+BRIDGE_HOSTS_FILE=/workspaces/.claude/bridge-hosts.conf
+
+# curl/wget wrappers that consult BRIDGE_HOSTS_FILE and add the SOCKS5
+# proxy only when the request's host is in the list; everything else
+# goes direct, same as calling curl/wget normally.
+_bridge_host_routed() {
+  local host=$1
+  [ -f "$BRIDGE_HOSTS_FILE" ] && grep -qxF "$host" "$BRIDGE_HOSTS_FILE"
+}
+bridge-curl() {
+  local url=$1; shift || true
+  local host
+  host=$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://##; s#[/:].*##')
+  if _bridge_host_routed "$host"; then
+    command curl --socks5-hostname "localhost:${BRIDGE_PORT}" "$url" "$@"
+  else
+    command curl "$url" "$@"
+  fi
+}
+# Note: GNU wget has no SOCKS support (only HTTP CONNECT proxies), so
+# there's no bridge-wget — route wget traffic via bridge-curl instead,
+# or add a real HTTP proxy in front of the bridge if wget is required.
 
 # Daily ACP kubeconfig sync.
 # Resolves the current daily URL via the stable redirect $ACP_DAILY_ENTRY,

@@ -23,12 +23,52 @@ retry() {
 }
 
 # --- Claude Code -----------------------------------------------------------
-if [ ! -f /workspaces/.local/bin/claude ]; then
-  echo "Installing Claude Code..."
-  retry 5 5 bash -c 'export HOME=/workspaces && curl -fsSL https://claude.ai/install.sh | bash'
+# Always run the installer: it fetches the latest release, so a rebuild also
+# upgrades the persisted copy under /workspaces (the auto-updater only writes
+# to $HOME, which does not survive rebuilds).
+if [ -f /workspaces/.local/bin/claude ]; then
+  echo "Updating Claude Code (current: $(/workspaces/.local/bin/claude --version 2>/dev/null))..."
 else
-  echo "Claude Code already installed, skipping"
+  echo "Installing Claude Code..."
 fi
+retry 5 5 bash -c 'export HOME=/workspaces && curl -fsSL https://claude.ai/install.sh | bash'
+
+# --- Codex CLI --------------------------------------------------------------
+# Static musl binary from GitHub releases (no node in this image). Versioned
+# under /workspaces/.local/share/codex/<tag>/ and symlinked into .local/bin.
+# CODEX_HOME (config + login) lives in /workspaces/.codex via containerEnv.
+install_codex() {
+  local arch tag cur dir tmp
+  case "$(uname -m)" in
+    x86_64) arch=x86_64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    *) echo "  unsupported arch $(uname -m)"; return 0 ;;
+  esac
+  tag=$(curl -fsSL --max-time 20 https://api.github.com/repos/openai/codex/releases/latest \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$tag" ] || { echo "  could not resolve latest codex release"; return 1; }
+  cur=$(/workspaces/.local/bin/codex --version 2>/dev/null | awk '{print $NF}')
+  if [ "rust-v${cur}" = "$tag" ]; then
+    echo "Codex already at ${tag}, skipping"; return 0
+  fi
+  echo "Installing Codex ${tag} (current: ${cur:-none})..."
+  dir=/workspaces/.local/share/codex/${tag}
+  tmp=$(mktemp -d)
+  curl -fsSL --retry 3 --max-time 900 -o "$tmp/codex.tar.gz" \
+    "https://github.com/openai/codex/releases/download/${tag}/codex-${arch}-unknown-linux-musl.tar.gz" \
+    && tar -xzf "$tmp/codex.tar.gz" -C "$tmp" \
+    && mkdir -p "$dir" /workspaces/.local/bin \
+    && install -m 755 "$tmp/codex-${arch}-unknown-linux-musl" "$dir/codex" \
+    && ln -sfn "$dir/codex" /workspaces/.local/bin/codex
+  local rc=$?
+  rm -rf "$tmp"
+  [ $rc -eq 0 ] && echo "  codex $(/workspaces/.local/bin/codex --version 2>/dev/null) installed"
+  return $rc
+}
+retry 3 5 install_codex
+# CODEX_HOME must be user-writable (codex creates tmp/ there on every run).
+mkdir -p /workspaces/.codex
+[ -O /workspaces/.codex ] || sudo chown -R "$(id -u):$(id -g)" /workspaces/.codex
 
 # --- tmux ------------------------------------------------------------------
 if ! command -v tmux &>/dev/null; then
@@ -134,6 +174,15 @@ if [ -f "$FILES_DIR/acp-kubeconfig-sync" ]; then
   mkdir -p /workspaces/.local/bin /workspaces/.kube/configs
   install -m 755 "$FILES_DIR/acp-kubeconfig-sync" /workspaces/.local/bin/acp-kubeconfig-sync
   echo "acp-kubeconfig-sync installed at /workspaces/.local/bin/acp-kubeconfig-sync"
+fi
+
+# --- bridge-route ------------------------------------------------------------
+# Manages which hosts auto-route through the $BRIDGE_HOST SOCKS5 bridge
+# (bridge-up in bashrc.append): bridge-route {add|rm|list|sync} <host>.
+if [ -f "$FILES_DIR/bridge-route" ]; then
+  mkdir -p /workspaces/.local/bin
+  install -m 755 "$FILES_DIR/bridge-route" /workspaces/.local/bin/bridge-route
+  echo "bridge-route installed at /workspaces/.local/bin/bridge-route"
 fi
 
 # --- devpod.env (seed example if absent; never overwrite the live file) ----

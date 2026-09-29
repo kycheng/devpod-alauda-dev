@@ -72,7 +72,11 @@ jobs:
           sudo -u vscode -H bash -lc 'command -v code-server'
           # claude installs under HOME=/workspaces when post-create sets that
           sudo -u vscode -H bash -lc 'command -v claude || test -x /workspaces/.local/bin/claude'
+          # codex: static binary from GitHub releases, CODEX_HOME user-writable
+          /workspaces/.local/bin/codex --version | grep -F 'codex-cli'
+          test "$(stat -c %U /workspaces/.codex)" = vscode
           test -x /workspaces/.local/bin/acp-kubeconfig-sync
+          test -x /workspaces/.local/bin/bridge-route
           test -d /workspaces/.kube/configs
           test -d /workspaces/claude-discord-multisession/.git
           # plugin checkout pinned to the patch base; patch must have applied.
@@ -88,6 +92,9 @@ jobs:
           ! grep -E '07Apples@|admin@cpaas\.io' /workspaces/.local/bin/acp-kubeconfig-sync
           # bashrc.append does not embed internal hostnames
           ! grep -E 'daily-devops\.alaudatech\.net|edge\.alauda\.cn' /workspaces/.bashrc
+          # bridge helpers load, and refuse to run without BRIDGE_HOST
+          sudo -u vscode -H bash -c '. /workspaces/.bashrc && type bridge-up bridge-down bridge-status bridge-curl' >/dev/null
+          ! sudo -u vscode -H bash -c '. /workspaces/.bashrc && BRIDGE_HOST= && bridge-up'
 
       - name: marker file to verify CLAUDE.md is not overwritten on re-run
         run: |
@@ -109,3 +116,6 @@ jobs:
           grep -q 'Go go1.26.4 already installed, skipping' /tmp/warm.log
           # zellij didn't re-download
           grep -q 'zellij already installed, skipping' /tmp/warm.log
+          # codex didn't re-download; claude installer re-ran as an update
+          grep -q 'Codex already at rust-v' /tmp/warm.log
+          grep -q 'Updating Claude Code' /tmp/warm.log
