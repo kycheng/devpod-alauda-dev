@@ -2,7 +2,7 @@
 
 DevPod configuration for Alauda-style development.
 
-The repo is intentionally free of internal hostnames and credentials — those come from `$ACP_DAILY_ENTRY`, `$ACP_DEFAULT_USER`, `$ACP_DEFAULT_PASS`, etc., sourced at shell startup from `/workspaces/.claude/devpod.env` (gitignored, per-user).
+The repo is intentionally free of internal hostnames and credentials — those come from `$ACP_DEFAULT_USER`, `$ACP_DEFAULT_PASS`, etc., sourced at shell startup from `/workspaces/.claude/devpod.env` (gitignored, per-user).
 
 ## What's auto-installed (via `.devcontainer/post-create.sh`)
 
@@ -15,7 +15,7 @@ The repo is intentionally free of internal hostnames and credentials — those c
 | tmux | system apt | Convenience. |
 | zellij 0.44.3 | `/workspaces/bin/zellij` | Plus user config seeded from `.devcontainer/files/zellij/config.kdl` (never overwritten). |
 | claude-discord-multisession | `/workspaces/claude-discord-multisession` | Cloned from upstream `github.com/danielfbm/claude-discord-multisession`, with local patches from `.devcontainer/files/claude-discord-multisession.patch` applied. |
-| acp-kubeconfig-sync | `/workspaces/.local/bin/acp-kubeconfig-sync` | ACP login + per-cluster kubeconfig sync, used by the `acp-sync-daily` helper. |
+| acp-kubeconfig-sync | `/workspaces/.local/bin/acp-kubeconfig-sync` | ACP login + per-cluster kubeconfig sync (`acp-kubeconfig-sync https://<host>/ --out-dir /workspaces/.kube/configs`). |
 
 ## Shell helpers
 
@@ -25,7 +25,6 @@ Appended to `/workspaces/.bashrc` between `# --- BEGIN devpod-alauda-dev managed
 |---|---|
 | `mac <cmd>` | Run `<cmd>` on the user's local machine via the reverse SSH tunnel `ssh mac` (alias must be set up in `~/.ssh/config`). |
 | `cc` | Shortcut for `/workspaces/.local/bin/claude`. |
-| `acp-sync-daily` | Resolve current daily ACP via `$ACP_DAILY_ENTRY`, then sync `--cluster=$ACP_DEFAULT_CLUSTER` kubeconfig into `/workspaces/.kube/configs/`. Pass through any extra `acp-kubeconfig-sync` flags. Fails fast with a clear message if required env vars are missing. |
 
 ## Configuring secrets / internal addresses
 
@@ -36,18 +35,12 @@ Two per-user, per-environment things stay out of the repo:
 The post-create script seeds this from `.devcontainer/files/devpod.env.example` if it's absent. Open it and fill in the values for your environment:
 
 ```sh
-# Daily ACP rotating env entry point (302-redirects to the current daily)
-export ACP_DAILY_ENTRY=http://<your-stable-daily-entry>/
-
 # Default credentials for acp-kubeconfig-sync
 export ACP_DEFAULT_USER=<user>
 export ACP_DEFAULT_PASS=<pass>
-
-# Optional: default cluster filter
-export ACP_DEFAULT_CLUSTER=<cluster-name>
 ```
 
-After editing, `source /workspaces/.claude/devpod.env` (or open a new shell) and run `acp-sync-daily` once to verify.
+After editing, `source /workspaces/.claude/devpod.env` (or open a new shell) and run `acp-kubeconfig-sync https://<host>/ --dry-run` once to verify.
 
 ### 2. Other out-of-band files
 
