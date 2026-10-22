@@ -215,6 +215,25 @@ if [ -f "$BASHRC" ] && [ -f "$FILES_DIR/bashrc.append" ]; then
   fi
 fi
 
+# --- Persist ~/.ssh across rebuilds ----------------------------------------
+# $HOME/.ssh gets wiped whenever the base image reseeds $HOME on rebuild,
+# taking the `Host mac` reverse-tunnel alias with it. Relocate the whole
+# directory under /workspaces so the config and any host keys survive. The
+# user is still responsible for populating it the first time (config,
+# authorized_keys, private keys).
+SSH_STATE=/workspaces/.ssh
+if [ ! -L "$HOME/.ssh" ]; then
+  mkdir -p "$SSH_STATE"
+  if [ -d "$HOME/.ssh" ]; then
+    cp -an "$HOME/.ssh/." "$SSH_STATE/" 2>/dev/null || true
+    rm -rf "$HOME/.ssh"
+  fi
+  # After the copy: `cp -a .` carries the source dir's mode onto SSH_STATE.
+  chmod 700 "$SSH_STATE"
+  ln -s "$SSH_STATE" "$HOME/.ssh"
+  echo "Linked $HOME/.ssh -> $SSH_STATE"
+fi
+
 # --- Persist ~/.env.alauda across rebuilds ----------------------------------
 # Jira/GitLab tokens sourced by scripts and Claude sessions. $HOME is reseeded
 # on rebuild, so keep the real file under /workspaces/.claude and link it
