@@ -215,6 +215,24 @@ if [ -f "$BASHRC" ] && [ -f "$FILES_DIR/bashrc.append" ]; then
   fi
 fi
 
+# --- Persist ~/.env.alauda across rebuilds ----------------------------------
+# Jira/GitLab tokens sourced by scripts and Claude sessions. $HOME is reseeded
+# on rebuild, so keep the real file under /workspaces/.claude and link it
+# back. The user populates it the first time (copy from the Mac).
+ENV_ALAUDA=/workspaces/.claude/env.alauda
+if [ ! -L "$HOME/.env.alauda" ]; then
+  if [ -f "$HOME/.env.alauda" ] && [ ! -f "$ENV_ALAUDA" ]; then
+    mkdir -p /workspaces/.claude
+    cp -p "$HOME/.env.alauda" "$ENV_ALAUDA"
+  fi
+  if [ -f "$ENV_ALAUDA" ]; then
+    chmod 600 "$ENV_ALAUDA"
+    rm -f "$HOME/.env.alauda"
+    ln -s "$ENV_ALAUDA" "$HOME/.env.alauda"
+    echo "Linked $HOME/.env.alauda -> $ENV_ALAUDA"
+  fi
+fi
+
 # --- Seed CLAUDE.md if absent (never overwrite) ----------------------------
 CLAUDE_MD=/workspaces/.claude/CLAUDE.md
 if [ ! -f "$CLAUDE_MD" ] && [ -f "$FILES_DIR/CLAUDE.md.template" ]; then
