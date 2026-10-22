@@ -45,27 +45,6 @@ Details:
 - Pipeline platform is typically **Tekton** (`tekton.dev/v1`): `pipelineruns`, `taskruns`, `pipelines`, `tasks`.
 - For locating a specific run: if the user gives a PR / commit / pipeline name and not the namespace, fall back to `kubectl get pipelineruns -A | grep <substring>` to find the namespace first, then narrow with `-n`.
 
-## Daily ACP access (rotating env via acp-kubeconfig-sync)
-
-For anything related to the user's **rotating daily** ACP environment — kubectl against the current daily cluster, pipeline runs there, plugin upload flows, "refresh / login daily / acp login failed" type asks — use the `acp-sync-daily` shell helper in `/workspaces/.bashrc`:
-
-```sh
-acp-sync-daily            # resolve current daily URL, sync default cluster's kubeconfig
-acp-sync-daily --dry-run  # see what it would do without writing
-acp-sync-daily --cluster=foo --cluster=bar  # override cluster filter
-```
-
-Behind the scenes:
-
-- The current daily ACP rotates (its URL changes periodically). **Never hardcode the rotating URL anywhere.**
-- The **stable entry point** comes from the `$ACP_DAILY_ENTRY` env var (set in `/workspaces/.claude/devpod.env`), which is expected to 302-redirect to whichever daily is current. The helper resolves it via `curl -Ls -o /dev/null -w '%{url_effective}'` and uses the resulting `https://.../` base.
-- Per-cluster kubeconfigs land in `/workspaces/.kube/configs/<acp-slug>--<cluster>.yaml`, each stamped `# generated-by: acp-kubeconfig-sync` so re-runs only overwrite our own files.
-- Credentials come from `$ACP_DEFAULT_USER` and `$ACP_DEFAULT_PASS` (also in `devpod.env`). Override per-call with `-u/-p`. Tokens last ~24h — rerun when they expire.
-- The script is Python 3 stdlib + `openssl` (RSA-PKCS1 encrypt) — both present in devpod.
-- Distinct from Edge cluster access above: **edge** = long-lived manually-pinned kubeconfig. **daily** = rotating ACP, short-lived (~24 h) token, auto-resolved + auto-synced via this helper. Don't mix them.
-
-If the helper reports "❌ resolve … failed" or "❌ /dex/pubkey unreachable", that's an infra signal (entry point down / daily mid-rotation) — surface it to the user, do not invent fallbacks.
-
 ## Where the addresses / credentials actually live
 
-This file deliberately contains **no hostnames, no credentials, no internal infra details**. Those are kept in `/workspaces/.claude/devpod.env` (sourced by `~/.bashrc`, not committed). Template at `.devcontainer/files/devpod.env.example`. If a tool here references `$ACP_DAILY_ENTRY` or `$ACP_DEFAULT_USER`, those resolve to whatever the user set there.
+This file deliberately contains **no hostnames, no credentials, no internal infra details**. Those are kept in `/workspaces/.claude/devpod.env` (sourced by `~/.bashrc`, not committed). Template at `.devcontainer/files/devpod.env.example`. If a tool here references `$ACP_DEFAULT_USER`, those resolve to whatever the user set there.

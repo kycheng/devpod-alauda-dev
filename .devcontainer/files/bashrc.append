@@ -98,23 +98,4 @@ bridge-curl() {
 # there's no bridge-wget — route wget traffic via bridge-curl instead,
 # or add a real HTTP proxy in front of the bridge if wget is required.
 
-# Daily ACP kubeconfig sync.
-# Resolves the current daily URL via the stable redirect $ACP_DAILY_ENTRY,
-# then drops one kubeconfig per matched cluster into /workspaces/.kube/configs/.
-# Required env: ACP_DAILY_ENTRY, ACP_DEFAULT_USER, ACP_DEFAULT_PASS
-# Optional env: ACP_DEFAULT_CLUSTER (default cluster filter)
-acp-sync-daily() {
-  local entry="${ACP_DAILY_ENTRY:?set ACP_DAILY_ENTRY in /workspaces/.claude/devpod.env}"
-  local cluster="${ACP_DEFAULT_CLUSTER:-}"
-  local resolved base
-  resolved=$(curl -Ls -o /dev/null -w "%{url_effective}" --max-time 10 "$entry") \
-    || { echo "❌ resolve $entry failed — daily entry may be down" >&2; return 2; }
-  base=$(printf '%s' "$resolved" | sed -E 's,^(https?://[^/]+).*,\1/,')
-  curl -sSk --max-time 6 -o /dev/null "${base}dex/pubkey" \
-    || { echo "❌ resolved=$base /dex/pubkey unreachable — daily may be mid-rotation" >&2; return 3; }
-  printf '→ daily = %s\n' "$base" >&2
-  local args=(--out-dir /workspaces/.kube/configs)
-  [ -n "$cluster" ] && args+=(--cluster="$cluster")
-  /workspaces/.local/bin/acp-kubeconfig-sync "$base" "${args[@]}" "$@"
-}
 # --- END devpod-alauda-dev managed ---
