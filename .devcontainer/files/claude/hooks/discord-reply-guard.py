@@ -10,7 +10,7 @@ import sys
 
 TAIL_BYTES = 8 * 1024 * 1024
 MARKER = '<channel source="plugin:discord'
-REPLY_TOOLS = ("discord__reply", "discord__discord_ask")
+REPLY_TOOLS = ("discord__reply", "discord__discord_ask", "discord__edit_message")
 
 
 def tail_lines(path):
@@ -22,24 +22,28 @@ def tail_lines(path):
     return lines[1:] if size > TAIL_BYTES else lines
 
 
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
+
+
 def is_inbound(record):
     kind = record.get("type")
     if kind == "attachment":
         attachment = record.get("attachment") or {}
-        return attachment.get("type") == "queued_command" and MARKER in json.dumps(
-            attachment, ensure_ascii=False
-        ).replace('\\"', '"')
-    if kind != "user":
+        if attachment.get("type") != "queued_command":
+            return False
+        text = text_of(attachment.get("prompt"))
+    elif kind == "user" and not record.get("isCompactSummary"):
+        text = text_of((record.get("message") or {}).get("content"))
+    else:
         return False
-    content = (record.get("message") or {}).get("content")
-    if isinstance(content, str):
-        return MARKER in content
-    if isinstance(content, list):
-        return any(
-            isinstance(b, dict) and b.get("type") == "text" and MARKER in b.get("text", "")
-            for b in content
-        )
-    return False
+    return text.lstrip().startswith(MARKER)
 
 
 def replied(record):

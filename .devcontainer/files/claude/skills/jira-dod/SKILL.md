@@ -9,7 +9,7 @@ Run these steps without waiting to be asked. Stop only at the listed decision po
 
 ## Start
 1. Read the ticket with comments, its parent Epic and any linked reference ticket (credentials: `CLAUDE.md` table).
-2. Read `/workspaces/.claude/knowledge/INDEX.md`. If the ticket has an Epic, read `/workspaces/.claude/epics/<EPIC>.md` when it exists.
+2. Read `/workspaces/.claude/knowledge/INDEX.md` when it exists. If the ticket has an Epic, read `/workspaces/.claude/epics/<EPIC>.md` when it exists.
 3. If `/workspaces/.claude/handoff/<JIRA>.md` exists, resume from it.
 4. Branch from `origin/<target>`. Confirm scope and plan with the user only when the ticket is ambiguous or contradicts itself.
 
@@ -23,7 +23,7 @@ Run these steps without waiting to be asked. Stop only at the listed decision po
 - **Wrong direction:** when an approach fails or the user rejects it, record the conclusion in the handoff file and restart from it instead of stacking fixes. In a terminal session, suggest `/rewind`.
 
 ## After opening or updating an MR
-1. Start `pr-watch <mr-url>` as a background command and let its exit wake you. Do not poll with `ScheduleWakeup` or `Monitor` as well. Re-arm it after handling each event. For a quick look use `pr-watch <mr-url> --once`.
+1. Start `pr-watch <mr-url>` as a background command and let its exit wake you. Do not poll with `ScheduleWakeup` or `Monitor` as well. Re-arm it after handling each event, except after exit code 4 (MR merged or closed). For a quick look use `pr-watch <mr-url> --once`.
 2. On a failure, find the cause in a subagent and keep only the conclusion in the main thread.
 3. After each significant change, review the diff in a fresh subagent that gets the diff and the ticket but not your reasoning, then post the result as an MR comment. Assess each review comment on merit, fix the valid ones and say why for the rest.
 4. Merge only when the launch prompt or the user authorised it for this MR. `pr-watch` also reports a merge done by the user; continue to the next step without being told.
@@ -46,7 +46,7 @@ Scope changes, merge or tag without prior authorisation, actions on shared/edge/
 
 ## Gotchas
 Recurring failures from past tickets. Add to this list when one repeats.
-- A file `violet push` can exit 0 without pushing images; check the images really arrived (`violet-push-from-devpod-gotchas.md` in knowledge).
+- A file `violet push` can exit 0 without pushing images; check the images really arrived (see the shared knowledge folder).
 - Test with the template's real rendering path. A sibling ticket's Ingress form failed to render only under Playwright.
 - A green pipeline on the MR says nothing about the merged build. Re-check after merge before installing.
 - Don't report that nothing exists from an empty kubectl result without checking the exit code.

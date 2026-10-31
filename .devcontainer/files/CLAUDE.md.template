@@ -68,4 +68,4 @@ Keep in the main thread: decisions for the user, writes to the environment or wo
 
 - Knowledge that applies across repos lives in `/workspaces/.claude/knowledge/`, indexed by `INDEX.md`. Never store secret values there.
 - For a Jira ticket, follow the `jira-dod` skill. Sibling tickets share `/workspaces/.claude/epics/<epic>.md`.
-- Production clusters are read-only for Claude; the `prod-write-guard` hook enforces it.
+- Production clusters are read-only for Claude. The `prod-write-guard` hook catches common write commands, but it is only a guard rail.

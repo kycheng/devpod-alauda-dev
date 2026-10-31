@@ -16,11 +16,29 @@ TAIL_BYTES = 16 * 1024 * 1024
 KEEP_DAYS = 14
 LINK = re.compile(r"https://[\w.-]+/[^\s\"'<>)\\]*(?:merge_requests|pull)/\d+")
 TICKET = re.compile(r"\b[A-Z][A-Z0-9]+-\d{3,}\b")
+TAG = re.compile(r"<[^>]+>")
+SECRET = re.compile(r"(?i)\b(password|passwd|token|secret|密码)\s*[:=：]?\s*\S+")
 SKIP = ("<task-notification", "<command-", "<local-command", "<system-reminder", "[Request interrupted")
 
 
 def snapshot_path(session):
     return os.path.join(DIR, f"{session}.md")
+
+
+def user_text(record):
+    """Text of a user message, including ones queued while a turn was running."""
+    if record.get("type") == "attachment":
+        attachment = record.get("attachment") or {}
+        content = attachment.get("prompt") if attachment.get("type") == "queued_command" else ""
+    elif record.get("type") == "user" and not record.get("isCompactSummary"):
+        content = (record.get("message") or {}).get("content")
+    else:
+        return ""
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return ""
+        return " ".join(b.get("text", "") for b in content if isinstance(b, dict))
+    return content if isinstance(content, str) else ""
 
 
 def read_state(path):
@@ -35,15 +53,9 @@ def read_state(path):
             record = json.loads(line)
         except ValueError:
             continue
-        if record.get("type") != "user":
-            continue
-        content = (record.get("message") or {}).get("content")
-        if isinstance(content, list):
-            if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-                continue
-            content = " ".join(b.get("text", "") for b in content if isinstance(b, dict))
-        if isinstance(content, str) and content.strip() and not content.lstrip().startswith(SKIP):
-            messages.append(re.sub(r"<[^>]+>", "", content).strip())
+        message = user_text(record)
+        if message.strip() and not message.lstrip().startswith(SKIP):
+            messages.append(SECRET.sub(r"\1=[redacted]", TAG.sub("", message).strip()))
     return list(links)[-20:], messages[-8:]
 
 
@@ -53,22 +65,32 @@ def branch(cwd):
     return out.stdout.strip() or "(none)"
 
 
-def save(payload):
-    os.makedirs(DIR, mode=0o700, exist_ok=True)
+def sweep():
     for name in os.listdir(DIR):
         old = os.path.join(DIR, name)
-        if time.time() - os.path.getmtime(old) > KEEP_DAYS * 86400:
-            os.remove(old)
+        try:
+            if time.time() - os.path.getmtime(old) > KEEP_DAYS * 86400:
+                os.remove(old)
+        except OSError:
+            pass
+
+
+def save(payload):
+    os.makedirs(DIR, mode=0o700, exist_ok=True)
+    path = snapshot_path(payload["session_id"])
+    # A failure below must not leave the previous compaction's file looking current.
+    if os.path.exists(path):
+        os.remove(path)
+    sweep()
     links, messages = read_state(payload["transcript_path"])
     cwd = payload.get("cwd") or os.getcwd()
     tickets = sorted(set(TICKET.findall(" ".join(messages))))
-    lines = [f"# Pre-compaction snapshot {time.strftime('%Y-%m-%d %H:%M:%S')} UTC", "",
+    lines = [f"# Pre-compaction snapshot {time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())} UTC", "",
              f"- cwd: {cwd}", f"- branch: {branch(cwd)}",
              f"- tickets: {', '.join(tickets) or '(none)'}", "", "## MR/PR links"]
     lines += [f"- {u}" for u in links] or ["- (none)"]
     lines += ["", "## Recent user messages (oldest first)"]
     lines += [f"- {m[:400]}" for m in messages]
-    path = snapshot_path(payload["session_id"])
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write("\n".join(lines) + "\n")

@@ -52,13 +52,13 @@ After editing, `source /workspaces/.claude/devpod.env` (or open a new shell) and
 
 ## Claude Code hooks, skills and tools
 
-`post-create.sh` runs `.devcontainer/files/claude/install.py`, which is safe to re-run. It overwrites its own files and merges into `settings.json` without touching other settings.
+`post-create.sh` runs `.devcontainer/files/claude/install.py`, which is safe to re-run. It overwrites its own hooks and tools, keeps skill files edited locally, and merges into `settings.json` without touching other settings.
 
 | Item | Purpose |
 |---|---|
-| `pr-watch <mr-url>` | Exits only when an MR needs attention, so a background run replaces timer polling. `--once` prints the status. Set `PR_WATCH_HOST` for another GitLab host. |
+| `pr-watch <mr-url>` | Exits only when an MR needs attention, so a background run replaces timer polling. `--once` prints the status. The host comes from the URL; a Mac `glab` over `ssh` is the fallback. |
 | `discord-reply-guard` (Stop) | Blocks ending a turn while the latest Discord message has no reply. |
-| `prod-write-guard` (PreToolUse) | Blocks cluster writes to a kubeconfig or context with a `prod` segment, in every permission mode. Use the `!` prefix to run one yourself. It only sees the command text, so it is a guard rail, not a security boundary. |
+| `prod-write-guard` (PreToolUse) | Blocks `kubectl`/`oc`/`helm` writes whose kubeconfig or context name has a `prod` or `prd` segment, in every permission mode, including through `ssh`, `bash -c` and shell heredocs. Use the `!` prefix to run one yourself. It cannot see inside scripts, `$(...)`, loop variables or direct API calls, so it is a guard rail, not a security boundary. |
 | `compact-snapshot` (PreCompact, SessionStart) | Saves MR links and recent instructions before compaction and points the session to them afterwards. |
 | `skill-usage-log` (PreToolUse) | Records skill use in `/workspaces/.claude/state/skill-usage.jsonl`. |
 | `jira-dod` skill | Start-up, MR, acceptance and close-out steps for a ticket. |
