@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Watch a GitLab merge request and exit only when something needs attention.
+
+Usage:
+  pr-watch <mr-url> --once          print one status line and exit
+  pr-watch <mr-url> [--interval S] [--timeout S]   block until an event
+
+Run the blocking form as a background command: the exit is the single wake-up.
+Exit codes: 0 event reported, 2 timed out with nothing new, 3 API unreachable or
+MR not found, 4 MR already merged or closed (don't re-arm).
+Reported events are remembered per MR, so re-arming does not repeat them. Comments
+containing NOTE_MARKER are the agent's own and do not count as new.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.parse
+
+STATE_DIR = os.path.expanduser("~/.cache/pr-watch")
+SSH_HOST = os.environ.get("PR_WATCH_SSH_HOST", "mac")
+NOTE_MARKER = "<!-- claude -->"
+FAILED = {"failed", "canceled"}
+RUNNING = {"pending", "running", "created", "preparing", "waiting_for_resource", "scheduled"}
+MAX_API_FAILURES = 10
+API_ERRORS = (RuntimeError, ValueError, OSError, subprocess.SubprocessError)
+
+
+class NotFound(Exception):
+    pass
+
+
+def token(host):
+    query = f"protocol=https\nhost={host}\n\n"
+    try:
+        out = subprocess.run(
+            ["git", "credential", "fill"], input=query, capture_output=True, text=True, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return next((l[9:] for l in out.splitlines() if l.startswith("password=")), "")
+
+
+def via_devpod(host, path):
+    tok = token(host)
+    if not tok:
+        raise RuntimeError("no devpod credential")
+    # The token goes through stdin so it stays out of the process list.
+    config = f'header = "PRIVATE-TOKEN: {tok}"\n'
+    out = subprocess.run(
+        ["curl", "-sSf", "--max-time", "30", "--socks5-hostname", "localhost:1080",
+         "-K", "-", f"https://{host}/api/v4/{path}"],
+        input=config, capture_output=True, text=True, timeout=40,
+    )
+    if out.returncode:
+        raise RuntimeError(out.stderr.strip())
+    return json.loads(out.stdout)
+
+
+def via_mac(host, path):
+    remote = f"glab api --hostname {host} '{path}'"
+    out = subprocess.run(
+        ["ssh", "-o", "ConnectTimeout=8", SSH_HOST, f'zsh -lc "{remote}"'],
+        capture_output=True, text=True, timeout=60,
+    )
+    if out.returncode:
+        raise RuntimeError(out.stderr.strip()[-200:])
+    return json.loads(out.stdout)
+
+
+def api(host, path):
+    try:
+        return via_devpod(host, path)
+    except API_ERRORS as first:
+        try:
+            return via_mac(host, path)
+        except API_ERRORS as second:
+            if "404" in str(first) and "404" in str(second):
+                raise NotFound(path) from second
+            raise
+
+
+def parse_url(url):
+    match = re.match(r"https?://([\w.-]+)/(.+?)/-/merge_requests/(\d+)", url)
+    if not match:
+        sys.exit(f"not a GitLab merge request URL: {url}")
+    return match.groups()
+
+
+def latest_statuses(statuses):
+    """Newest result per check; the API may list several for one name."""
+    latest = {}
+    for item in statuses:
+        name = item["name"]
+        if name not in latest or item["id"] > latest[name]["id"]:
+            latest[name] = item
+    return latest
+
+
+def own_note(note):
+    return note.get("system") or NOTE_MARKER in (note.get("body") or "")
+
+
+def snapshot(host, group, iid):
+    project = "projects/" + urllib.parse.quote(group, safe="")
+    mr = api(host, f"{project}/merge_requests/{iid}")
+    latest = {}
+    if mr.get("sha"):
+        # Newest first, so anything past the first page is older than what is kept.
+        latest = latest_statuses(api(
+            host, f"{project}/repository/commits/{mr['sha']}/statuses?sort=desc&order_by=id&per_page=100"))
+    notes = api(host, f"{project}/merge_requests/{iid}/notes?sort=desc&order_by=updated_at&per_page=100")
+    return {
+        "state": mr.get("state"),
+        "sha": (mr.get("sha") or "")[:10],
+        "conflicts": bool(mr.get("has_conflicts")),
+        "note_ids": sorted(n["id"] for n in notes if not own_note(n)),
+        "latest": latest,
+        "failed": sorted(n for n, s in latest.items() if s["status"] in FAILED),
+        "running": sorted(n for n, s in latest.items() if s["status"] in RUNNING),
+        "passed": sorted(n for n, s in latest.items() if s["status"] == "success"),
+        "links": {n: s.get("target_url") for n, s in latest.items() if s["status"] in FAILED},
+    }
+
+
+def run_key(status):
+    # finished_at separates a rerun that reuses the status id.
+    return f"{status['id']}:{status.get('finished_at')}"
+
+
+def signatures(snap):
+    """Conditions worth a wake-up, each named so it fires only once per run."""
+    found = set()
+    if snap["state"] != "opened":
+        found.add(f"state:{snap['state']}")
+    if snap["conflicts"]:
+        found.add(f"conflict:{snap['sha']}")
+    for name in snap["failed"]:
+        found.add(f"failed:{snap['sha']}:{name}:{run_key(snap['latest'][name])}")
+    if snap["passed"] and not snap["failed"] and not snap["running"]:
+        newest = max((snap["latest"][n] for n in snap["passed"]), key=lambda s: s["id"])
+        found.add(f"passed:{snap['sha']}:{run_key(newest)}")
+    return found
+
+
+def line(snap):
+    parts = [f"state={snap['state']}", f"sha={snap['sha']}", f"comments={len(snap['note_ids'])}",
+             f"passed={len(snap['passed'])}", f"running={len(snap['running'])}",
+             f"failed={','.join(snap['failed']) or 0}"]
+    if snap["conflicts"]:
+        parts.append("conflicts=yes")
+    return " ".join(parts)
+
+
+def print_snapshot(snap):
+    print(line(snap))
+    for name, link in snap["links"].items():
+        print(f"  {name}: {link}")
+
+
+def load_state(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path, seen, last_note):
+    # Losing the state only risks a repeated event, so never let it hide one.
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"seen": sorted(seen), "last_note": last_note}, f)
+        os.replace(tmp, path)
+    except OSError as err:
+        print(f"warning: could not save state: {err}", file=sys.stderr)
+
+
+def watch(host, group, iid, interval, timeout, sleep=time.sleep, clock=time.time):
+    state_path = os.path.join(STATE_DIR, re.sub(r"\W+", "_", f"{host}_{group}_{iid}") + ".json")
+    state = load_state(state_path)
+    seen = set(state.get("seen", []))
+    last_note = state.get("last_note")
+    deadline = clock() + timeout
+    failures = 0
+    snap = None
+    while clock() < deadline:
+        try:
+            snap = snapshot(host, group, iid)
+            failures = 0
+        except NotFound as err:
+            print(f"MR not found: {err}")
+            return 3
+        except API_ERRORS as err:
+            failures += 1
+            if failures >= MAX_API_FAILURES:
+                print(f"API unreachable after {failures} attempts: {err}")
+                return 3
+            sleep(interval)
+            continue
+        if last_note is None:
+            last_note = max(snap["note_ids"], default=0)
+        if snap["state"] == "opened":
+            seen = {s for s in seen if not s.startswith("state:")}
+        new = sorted(signatures(snap) - seen)
+        fresh_notes = [n for n in snap["note_ids"] if n > last_note]
+        if new or fresh_notes:
+            seen |= set(new)
+            last_note = max(snap["note_ids"], default=last_note)
+            save_state(state_path, seen, last_note)
+            print("EVENT " + " ".join(new + ([f"new-comments:{len(fresh_notes)}"] if fresh_notes else [])))
+            print_snapshot(snap)
+            return 0
+        if snap["state"] != "opened":
+            save_state(state_path, seen, last_note)
+            print("DONE " + line(snap))
+            return 4
+        sleep(interval)
+    save_state(state_path, seen, last_note)
+    print("TIMEOUT nothing new; " + (line(snap) if snap else "no successful API call"))
+    return 2
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("url")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--interval", type=int, default=120)
+    parser.add_argument("--timeout", type=int, default=6 * 3600)
+    args = parser.parse_args()
+    host, group, iid = parse_url(args.url)
+    if not args.once:
+        return watch(host, group, iid, args.interval, args.timeout)
+    try:
+        print_snapshot(snapshot(host, group, iid))
+    except (NotFound, *API_ERRORS) as err:
+        print(f"API unreachable or MR not found: {err}")
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

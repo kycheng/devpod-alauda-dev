@@ -262,4 +262,9 @@ elif [ -f "$CLAUDE_MD" ]; then
   echo "$CLAUDE_MD already exists, leaving it alone (manual merge if you want template updates: diff with $FILES_DIR/CLAUDE.md.template)"
 fi
 
+# --- Claude Code hooks, skills and tools ------------------------------------
+if [ -f "$FILES_DIR/claude/install.py" ]; then
+  python3 "$FILES_DIR/claude/install.py" || echo "WARN: Claude config install failed; see above"
+fi
+
 echo "=== Setup Complete ==="

@@ -48,3 +48,24 @@ Details:
 ## Where the addresses / credentials actually live
 
 This file deliberately contains **no hostnames, no credentials, no internal infra details**. Those are kept in `/workspaces/.claude/devpod.env` (sourced by `~/.bashrc`, not committed). Template at `.devcontainer/files/devpod.env.example`. If a tool here references `$ACP_DEFAULT_USER`, those resolve to whatever the user set there.
+
+## Keep the main context small
+
+Every call re-reads the whole context, so what enters it is paid for repeatedly.
+
+- **Waiting on an MR:** run `pr-watch <mr-url>` in the background; it exits only on an event. Don't poll on a timer as well.
+- **Large output:** write it to a file and `grep` what you need.
+- **Long-running work:** split by stage and keep `/workspaces/.claude/handoff/<ticket>.md` current so a new session can continue.
+- **Wrong direction:** record the conclusion and restart from it rather than stacking fixes. In a terminal session, suggest `/rewind`.
+
+## Delegate to subagents by default
+
+Split work yourself and delegate without being asked when it won't change what the main thread is doing: unrelated requests arriving mid-task, log and code research, reviews (use a fresh subagent that gets the diff, not your reasoning), exploratory testing, and independent subtasks. Use `isolation: "worktree"` when a subagent edits code.
+
+Keep in the main thread: decisions for the user, writes to the environment or worktree the main task is using, and merges, tags and outward-facing messages. Don't delegate a handful of calls you can run directly.
+
+## Shared knowledge and tickets
+
+- Knowledge that applies across repos lives in `/workspaces/.claude/knowledge/`, indexed by `INDEX.md`. Never store secret values there.
+- For a Jira ticket, follow the `jira-dod` skill. Sibling tickets share `/workspaces/.claude/epics/<epic>.md`.
+- Production clusters are read-only for Claude. The `prod-write-guard` hook catches common write commands, but it is only a guard rail.
