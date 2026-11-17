@@ -16,30 +16,91 @@
 # registers in DM mode instead of thread mode — matches the pre-restart shape
 # recorded in daemon.log.
 #
+# Conversation resume: by default each session is started with
+# `claude --resume <id>`, where <id> is the newest transcript in
+# $CLAUDE_CONFIG_DIR/projects/<cwd-slug>/, so the pre-restart conversation
+# comes back. --fresh starts empty sessions instead; --session <uuid> picks a
+# specific transcript (only valid together with a single --only sid).
+#
+# Other pitfalls handled here (each one cost a manual restore before):
+# - Run from inside Claude, the launched zellij/claude would inherit
+#   CLAUDECODE / CLAUDE_CODE_* and the discord plugin never starts. All
+#   CLAUDE* vars except CLAUDE_CONFIG_DIR are unset up front.
+# - A `plugin:discord:discord` entry in mcp-needs-auth-cache.json makes new
+#   sessions skip the plugin for 15 min; it is removed (with a backup).
+# - zellij rejects session names longer than ~70 chars (socket path limit);
+#   the display part is truncated, the trailing -<sid> is kept.
+# - Success is checked in daemon.log (`register outcome=ok`), not assumed.
+#
 # Usage:
 #   restore-sessions [--dry-run] [--only <sid>[,<sid>...]] [--skip-confirm]
+#                    [--fresh] [--session <uuid>]
+#   restore-sessions --find <text>   # list bindings whose cwd matches <text>
 
 set -uo pipefail
 
 BINDINGS=${BINDINGS_JSON:-/workspaces/.claude/channels/discord/bindings.json}
 ZELLIJ=${ZELLIJ_BIN:-/workspaces/bin/zellij}
 CLAUDE_BIN=${CLAUDE_BIN:-claude}
+CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+DAEMON_LOG=${DAEMON_LOG:-$(dirname "$BINDINGS")/daemon.log}
+NEEDS_AUTH_CACHE=$CONFIG_DIR/mcp-needs-auth-cache.json
+MAX_SESSION_NAME=64
 
 DRY=0
 SKIP_CONFIRM=0
 ONLY=""
+FRESH=0
+SESSION_ID=""
+FIND=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY=1 ;;
     --skip-confirm) SKIP_CONFIRM=1 ;;
     --only) shift; ONLY=$1 ;;
+    --fresh) FRESH=1 ;;
+    --session) shift; SESSION_ID=$1 ;;
+    --find) shift; FIND=$1 ;;
     -h|--help)
-      sed -n '2,22p' "$0"; exit 0 ;;
+      sed -n '2,41p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+if [ -n "$FIND" ]; then
+  jq -r --arg f "$FIND" 'to_entries[] | select(.value.cwd | contains($f))
+    | "\(.key)\t\(.value.thread_id)\t\(.value.cwd)"' "$BINDINGS"
+  exit 0
+fi
+if [ -n "$SESSION_ID" ] && { [ -z "$ONLY" ] || [[ "$ONLY" == *,* ]]; }; then
+  echo "❌ --session needs exactly one --only <sid>" >&2; exit 2
+fi
+
+# Drop the caller's Claude session identity so the child Claude starts as a
+# top-level session and loads its channel plugin.
+for v in $(env | grep -oE '^CLAUDE[A-Z_]*' | sort -u); do
+  [ "$v" = CLAUDE_CONFIG_DIR ] || unset "$v"
+done
+
+if [ "$DRY" != 1 ] && [ -f "$NEEDS_AUTH_CACHE" ] && \
+   jq -e 'has("plugin:discord:discord")' "$NEEDS_AUTH_CACHE" >/dev/null 2>&1; then
+  cp "$NEEDS_AUTH_CACHE" "$NEEDS_AUTH_CACHE.bak-$(date +%s)"
+  tmp=$(mktemp)
+  jq 'del(.["plugin:discord:discord"])' "$NEEDS_AUTH_CACHE" > "$tmp" && mv "$tmp" "$NEEDS_AUTH_CACHE"
+  echo "🧹 removed plugin:discord:discord from $(basename "$NEEDS_AUTH_CACHE") (backup kept)"
+fi
+
+# Newest transcript id for a cwd, or empty. Claude stores transcripts under
+# projects/<cwd with every non-alphanumeric char turned into '-'>/<uuid>.jsonl.
+latest_transcript() {
+  local slug dir
+  slug=$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]/-/g')
+  dir="$CONFIG_DIR/projects/$slug"
+  [ -d "$dir" ] || return 0
+  ls -t "$dir"/*.jsonl 2>/dev/null | head -1 | xargs -r basename | sed 's/\.jsonl$//'
+}
 
 if [ ! -f "$BINDINGS" ]; then
   echo "❌ bindings.json missing: $BINDINGS" >&2; exit 1
@@ -87,23 +148,32 @@ confirm_plugin() {
   pidfile=$(mktemp); dump=$(mktemp)
   SHELL=/bin/bash setsid script -qfc \
     "bash -c 'echo \$\$ > $pidfile; exec env -u ZELLIJ -u ZELLIJ_SESSION_NAME $ZELLIJ attach $session'" \
-    /dev/null >/dev/null 2>&1 &
+    /dev/null </dev/null >/dev/null 2>&1 &
+  # stdin must be /dev/null: otherwise the transient client forwards whatever
+  # the caller's stdin carries (terminal keystrokes, piped output) into the
+  # Claude prompt.
   sleep 3
   cpid=$(cat "$pidfile" 2>/dev/null)
-  for _ in 1 2 3 4; do
+  # Claude can take 10s+ to draw the prompt (longer when resuming a big
+  # transcript), so sweep the panes for ~30s rather than once.
+  for _ in $(seq 1 30); do
+    # A dump that fails leaves the previous file in place; remove it first
+    # so a stale screen never counts as "prompt seen".
+    rm -f "$dump"
     env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action dump-screen --path "$dump" 2>/dev/null
     # Match on the plugin identifier + footer — neither wraps across lines.
     if grep -q 'plugin:discord@danielfbm-discord' "$dump" 2>/dev/null && \
        grep -q 'Enter to confirm' "$dump" 2>/dev/null; then
       env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action write-chars $'\r' 2>/dev/null
       sleep 2
+      rm -f "$dump"
       env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action dump-screen --path "$dump" 2>/dev/null
-      if ! grep -q 'Enter to confirm' "$dump" 2>/dev/null; then
+      if [ -s "$dump" ] && ! grep -q 'Enter to confirm' "$dump"; then
         sent=1; break
       fi
     fi
     env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" action focus-next-pane 2>/dev/null
-    sleep 0.3
+    sleep 1
   done
   [ -n "$cpid" ] && kill -TERM -"$cpid" 2>/dev/null
   rm -f "$pidfile" "$dump"
@@ -161,7 +231,18 @@ restore_one() {
     display=$(basename "$cwd")
   fi
   base=$(printf '%s' "$display" | sed 's/[^A-Za-z0-9_-]/-/g')
+  # "claude-" + base + "-" + 12-hex sid must fit zellij's name limit.
+  local max_base=$(( MAX_SESSION_NAME - 8 - ${#sid} ))
+  if [ "${#base}" -gt "$max_base" ]; then
+    base=${base:0:$max_base}; base=${base%-}
+  fi
   session="claude-${base}-${sid}"
+
+  local resume_id="" resume_arg=""
+  if [ "$FRESH" != 1 ]; then
+    resume_id=${SESSION_ID:-$(latest_transcript "$cwd")}
+    [ -n "$resume_id" ] && resume_arg="--resume $resume_id"
+  fi
 
   if is_dm_cwd "$cwd"; then
     mode="dm"
@@ -169,38 +250,59 @@ restore_one() {
     mode="thread"
   fi
 
-  printf '  ▶  %s  launching %s  (mode=%s, cwd=%s, thread=%s)\n' \
-    "$sid" "$session" "$mode" "$cwd" "${thread:-pending}"
+  printf '  ▶  %s  launching %s  (mode=%s, cwd=%s, thread=%s, resume=%s)\n' \
+    "$sid" "$session" "$mode" "$cwd" "${thread:-pending}" "${resume_id:-fresh}"
 
   if [ "$DRY" = 1 ]; then return; fi
 
+  # --resume goes before the variadic --dangerously-load-development-channels
+  # flag, which would otherwise swallow it as a channel name.
+  local claude_cmd="$CLAUDE_BIN $resume_arg --permission-mode bypassPermissions --dangerously-load-development-channels plugin:discord@danielfbm-discord"
   local cmd
   if [ "$mode" = "dm" ]; then
     # DM-mode: DISCORD_THREAD_ID/NAME MUST be unset for the shim to register
     # in mode=dm and receive channel-@ / DM traffic.
-    cmd="$CLAUDE_BIN --dangerously-load-development-channels plugin:discord@danielfbm-discord"
+    cmd="$claude_cmd"
   else
     # Thread-mode: DISCORD_THREAD_ID=auto tells the daemon to reuse an
     # existing bindings.json entry for this sid rather than creating a new
     # thread, so this rebinds back to the stored thread_id.
-    cmd="DISCORD_THREAD_ID=auto DISCORD_THREAD_NAME=$(printf %q "$display")"
-    cmd="$cmd $CLAUDE_BIN --dangerously-load-development-channels plugin:discord@danielfbm-discord"
+    cmd="DISCORD_THREAD_ID=auto DISCORD_THREAD_NAME=$(printf %q "$display") $claude_cmd"
   fi
+  local log_mark=0
+  [ -f "$DAEMON_LOG" ] && log_mark=$(wc -l < "$DAEMON_LOG")
 
-  env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" attach --create-background "$session" >/dev/null 2>&1
+  local err
+  if ! err=$(env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" attach --create-background "$session" 2>&1); then
+    printf '     ❌ zellij could not create %s: %s\n' "$session" "$err"; return
+  fi
   env -u ZELLIJ -u ZELLIJ_SESSION_NAME "$ZELLIJ" -s "$session" run \
     --close-on-exit --cwd "$cwd" -- bash -lc "$cmd" >/dev/null 2>&1
 
   printf '     ↳ launched. Attach with: zellij attach %s\n' "$session"
 
   if [ "$SKIP_CONFIRM" != 1 ]; then
-    sleep 4
     if confirm_plugin "$session"; then
       printf '     ↳ plugin prompt confirmed.\n'
     else
-      printf '     ⚠ plugin prompt not seen in 4 pane sweeps — attach manually and press Enter if it is still showing.\n'
+      printf '     ⚠ plugin prompt not seen in ~30s — attach manually and press Enter if it is still showing.\n'
     fi
   fi
+
+  # The daemon logs one register line per shim start; only lines written
+  # after this launch count.
+  local line=""
+  for _ in $(seq 1 30); do
+    line=$(tail -n +"$((log_mark + 1))" "$DAEMON_LOG" 2>/dev/null \
+      | grep "register outcome=.*session_id=${sid} " | tail -1)
+    [ -n "$line" ] && break
+    sleep 1
+  done
+  case "$line" in
+    *outcome=ok*) printf '     ✅ %s\n' "${line#discord daemon: }" ;;
+    "") printf '     ⚠ no register line in %s after 30s — attach and check /mcp\n' "$DAEMON_LOG" ;;
+    *) printf '     ❌ %s\n' "${line#discord daemon: }" ;;
+  esac
 }
 
 total=$(jq 'keys | length' "$BINDINGS")
