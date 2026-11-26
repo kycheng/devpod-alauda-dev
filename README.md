@@ -49,6 +49,10 @@ After editing, `source /workspaces/.claude/devpod.env` (or open a new shell) and
 | `/workspaces/.claude/edge.kubeconfig` | Long-lived Bearer token for an "edge" ACP. Format described in CLAUDE.md template. |
 | `/workspaces/.claude/credentials.env` | Jira / Sonar / WeChat creds (sourced by bashrc). |
 | `/workspaces/.claude/channels/discord/.env` | `DISCORD_BOT_TOKEN=...` for the discord multi-session plugin. Run `/discord:configure` inside a Claude Code session after dropping this in. |
+| `/workspaces/.claude/env.alauda` | Jira/GitLab tokens; `~/.env.alauda` is linked to it on every post-create run. Copy it from the Mac the first time. |
+| `/workspaces/.claude/gh/` | `gh` config dir (`~/.config/gh` links here), so `gh auth login` survives rebuilds. First time: `ssh mac '/opt/homebrew/bin/gh auth token' \| gh auth login --with-token`. |
+| `/workspaces/.netrc` → `/workspaces/.claude/git-credentials` | HTTPS git tokens. Each `machine` in the netrc gets a `store` credential helper for its host, so pushes keep working when the devpod credential agent is gone. The store file is seeded from the netrc once; update both when a token rotates. |
+| `/workspaces/.claude/glab-cli/` | `glab` config dir (`~/.config/glab-cli` links here). First time: `glab auth login --hostname <gitlab-host> --stdin`. |
 
 ## Claude Code hooks, skills and tools
 

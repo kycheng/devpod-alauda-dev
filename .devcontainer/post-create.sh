@@ -252,6 +252,62 @@ if [ ! -L "$HOME/.env.alauda" ]; then
   fi
 fi
 
+# --- Persist gh CLI login across rebuilds -----------------------------------
+# There is no keyring in the devpod, so gh stores its token in hosts.yml.
+# Keep the config dir under /workspaces so `gh auth login` survives restarts.
+# First-time seed: ssh mac '/opt/homebrew/bin/gh auth token' | gh auth login --with-token
+GH_STATE=/workspaces/.claude/gh
+if [ ! -L "$HOME/.config/gh" ]; then
+  mkdir -p "$GH_STATE" "$HOME/.config"
+  chmod 700 "$GH_STATE"
+  if [ -d "$HOME/.config/gh" ]; then
+    cp -an "$HOME/.config/gh/." "$GH_STATE/" 2>/dev/null || true
+    rm -rf "$HOME/.config/gh"
+  fi
+  ln -s "$GH_STATE" "$HOME/.config/gh"
+  echo "Linked $HOME/.config/gh -> $GH_STATE"
+fi
+
+# --- Persist git (HTTPS) and glab logins across rebuilds -------------------
+# The devpod credential agent dies when the IDE session disconnects, and
+# ~/.gitconfig is regenerated on rebuild. For every host in /workspaces/.netrc,
+# point git at a store file under /workspaces instead (the empty helper resets
+# the inherited agent for that host). The store file is seeded from the netrc
+# when missing; other hosts keep using the agent.
+GIT_CRED=/workspaces/.claude/git-credentials
+NETRC_FILE=/workspaces/.netrc
+if [ -f "$NETRC_FILE" ]; then
+  # Tokenize so both one-line and multi-line netrc entries parse.
+  netrc_entries=$(awk '{for (i = 1; i <= NF; i++) print $i}' "$NETRC_FILE" | awk '
+    $0 == "machine"  { getline h; next }
+    $0 == "login"    { getline l; next }
+    $0 == "password" { getline p; if (h != "" && l != "") print h, l, p; h = l = "" }')
+  if [ ! -f "$GIT_CRED" ] && [ -n "$netrc_entries" ]; then
+    (umask 077; printf '%s\n' "$netrc_entries" | awk '{print "https://" $2 ":" $3 "@" $1}' > "$GIT_CRED")
+  fi
+  if [ -f "$GIT_CRED" ]; then
+    chmod 600 "$GIT_CRED"
+    for h in $(printf '%s\n' "$netrc_entries" | awk '{print $1}'); do
+      git config --global --unset-all "credential.https://$h.helper" 2>/dev/null || true
+      git config --global --add "credential.https://$h.helper" ''
+      git config --global --add "credential.https://$h.helper" "store --file $GIT_CRED"
+      echo "git credentials for $h -> $GIT_CRED"
+    done
+  fi
+  unset netrc_entries h
+fi
+GLAB_STATE=/workspaces/.claude/glab-cli
+if [ ! -L "$HOME/.config/glab-cli" ]; then
+  mkdir -p "$GLAB_STATE" "$HOME/.config"
+  chmod 700 "$GLAB_STATE"
+  if [ -d "$HOME/.config/glab-cli" ]; then
+    cp -an "$HOME/.config/glab-cli/." "$GLAB_STATE/" 2>/dev/null || true
+    rm -rf "$HOME/.config/glab-cli"
+  fi
+  ln -s "$GLAB_STATE" "$HOME/.config/glab-cli"
+  echo "Linked $HOME/.config/glab-cli -> $GLAB_STATE"
+fi
+
 # --- Seed CLAUDE.md if absent (never overwrite) ----------------------------
 CLAUDE_MD=/workspaces/.claude/CLAUDE.md
 if [ ! -f "$CLAUDE_MD" ] && [ -f "$FILES_DIR/CLAUDE.md.template" ]; then
