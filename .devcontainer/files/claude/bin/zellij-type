@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Type a line into a detached zellij session (e.g. a Discord-bound Claude
+# session) and press Enter, then print the tail of its screen.
+#
+# `zellij action` only reaches a session that has a client attached, so this
+# attaches a transient pty-backed client (same trick as
+# claude-discord-multisession/scripts/await-dev-channels-prompt.sh) and reaps
+# it afterwards.
+#
+# Types into the pane whose title mentions claude.
+# Usage: zellij-type <session_name> <text>
+set -euo pipefail
+
+session="${1:?usage: zellij-type <session_name> <text>}"
+text="${2:?usage: zellij-type <session_name> <text>}"
+
+zellij ls -n 2>/dev/null | grep -q "^${session} " || { echo "zellij-type: no session ${session}" >&2; exit 2; }
+
+pidf="$(mktemp)"; screen="$(mktemp)"; pgid=""
+cleanup() {
+  if [ -n "$pgid" ]; then kill -TERM "-${pgid}" 2>/dev/null || true; fi
+  rm -f "$pidf" "$screen"
+}
+trap cleanup EXIT
+
+SHELL=/bin/bash setsid script -qfc \
+  "bash -c 'echo \$\$ > ${pidf}; exec env -u ZELLIJ -u ZELLIJ_SESSION_NAME zellij attach ${session}'" \
+  /dev/null >/dev/null 2>&1 &
+for _ in $(seq 30); do [ -s "$pidf" ] && { pgid="$(cat "$pidf")"; break; }; sleep 0.1; done
+sleep 1
+
+z() { env -u ZELLIJ -u ZELLIJ_SESSION_NAME zellij -s "$session" action "$@"; }
+# Target the pane running claude, not whichever pane happens to be focused.
+pane="$(z list-panes 2>/dev/null | awk '$2=="terminal" && /claude/ {print $1; exit}')"
+[ -n "$pane" ] || { echo "zellij-type: no claude pane in ${session}" >&2; exit 3; }
+z write-chars -p "$pane" "$text"
+sleep 0.3
+z write -p "$pane" 13
+sleep 2
+z dump-screen -p "$pane" --path "$screen" || true
+grep -v '^[[:space:]]*$' "$screen" | tail -n 8 || true
