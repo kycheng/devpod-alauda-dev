@@ -1,0 +1,2131 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import math
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+import yaml
+
+
+TOOLS_ENABLED = ["gitlab", "harbor", "sonar", "nexus"]
+TOOL_HOSTS = [
+    "gitlab-int-vm.alaudatech.net",
+    "harbor-int-vm.alaudatech.net",
+    "sonarqube-int-vm.alaudatech.net",
+    "nexus-non-anonymous-int-vm.alaudatech.net",
+    "nexus-anonymous-int-vm.alaudatech.net",
+]
+REGISTRY = "registry-dev.alauda.cn"
+
+
+def log(msg: str) -> None:
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ERROR: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def run(argv, *, input_text=None, timeout=120, capture=True):
+    try:
+        return subprocess.run(
+            argv,
+            input=input_text,
+            text=True,
+            capture_output=capture,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        return subprocess.CompletedProcess(argv, 124, stdout, stderr or f"timed out after {timeout}s")
+
+
+def load_cfg(path: Path) -> dict:
+    path.chmod(0o600)
+    with path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        die(f"invalid yaml config: {path}")
+    return cfg
+
+
+def creds_from_cfg(cfg: dict, ak_override: str | None = None,
+                   sk_override: str | None = None) -> tuple[str, str]:
+    if ak_override is not None or sk_override is not None:
+        if not ak_override or not sk_override:
+            die("both --ak and --sk must be provided when overriding config credentials")
+        return str(ak_override), str(sk_override)
+    ctyun = cfg.get("ctyun") or {}
+    ak = ctyun.get("accessKey") or ctyun.get("ak") or cfg.get("accessKey")
+    sk = ctyun.get("secretKey") or ctyun.get("sk") or cfg.get("secretKey")
+    if not ak or not sk:
+        die(
+            "config must include CTYun credentials at ctyun.accessKey and "
+            "ctyun.secretKey; this script intentionally reads no external "
+            "credential files"
+        )
+    return str(ak), str(sk)
+
+
+def endpoint_from_cfg(cfg: dict) -> str | None:
+    ctyun = cfg.get("ctyun") or {}
+    endpoint = ctyun.get("endpoint") or ctyun.get("CTYUN_ENDPOINT") or cfg.get("CTYUN_ENDPOINT")
+    if not endpoint:
+        return None
+    endpoint = str(endpoint).rstrip("/")
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        die(f"invalid CTYun endpoint: {endpoint}")
+    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+        die("CTYun endpoint must not include credentials, query parameters, or a fragment")
+    return endpoint
+
+
+def request_field_overrides_from_cfg(cfg: dict) -> dict[str, dict]:
+    ctyun = cfg.get("ctyun") or {}
+    raw = ctyun.get("requestFieldOverrides")
+    if raw is None:
+        raw = ctyun.get("CTYUN_REQUEST_FIELD_OVERRIDES")
+    if raw is None:
+        raw = cfg.get("CTYUN_REQUEST_FIELD_OVERRIDES")
+    if raw is None:
+        return {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as e:
+            die(f"invalid CTYUN_REQUEST_FIELD_OVERRIDES JSON: {e}")
+    if not isinstance(raw, dict):
+        die("ctyun.requestFieldOverrides must be a mapping of API paths to field mappings")
+    for path, fields in raw.items():
+        if not isinstance(path, str) or not path.startswith("/") or not isinstance(fields, dict):
+            die("ctyun.requestFieldOverrides must map absolute API paths to field mappings")
+    return raw
+
+
+class CtyunClient:
+    def __init__(
+        self,
+        ak: str,
+        sk: str,
+        region_id: str,
+        endpoint: str | None = None,
+        request_field_overrides: dict[str, dict] | None = None,
+    ):
+        self.ak = ak
+        self.sk = sk
+        self.region_id = region_id
+        self.endpoint = endpoint
+        self.request_field_overrides = request_field_overrides or {}
+
+    def call(self, host, path, *, method="GET", query=None, body=None):
+        query = query or {}
+        fields = self.request_field_overrides.get(path)
+        if fields and body is not None:
+            body = dict(body)
+            for name, value in fields.items():
+                if value is None:
+                    body.pop(name, None)
+                else:
+                    body[name] = value
+            log(f"applying request field overrides for {path}: {', '.join(sorted(fields))}")
+        body_str = json.dumps(body) if body is not None else ""
+        req_id = str(uuid.uuid4())
+        # Match CTYun's Go clients: render Asia/Shanghai wall-clock time while
+        # retaining the literal Z suffix expected by EOP/relay verification.
+        date = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%dT%H%M%SZ")
+        headers_str = f"ctyun-eop-request-id:{req_id}\neop-date:{date}\n"
+        qs = "&".join(
+            f"{k}={urllib.parse.quote(str(v), safe='-')}"
+            for k, v in sorted(query.items())
+        )
+        sig_input = f"{headers_str}\n{qs}\n{hashlib.sha256(body_str.encode()).hexdigest()}"
+        k_time = hmac.new(self.sk.encode(), date.encode(), hashlib.sha256).digest()
+        k_ak = hmac.new(k_time, self.ak.encode(), hashlib.sha256).digest()
+        k_date = hmac.new(k_ak, date[:8].encode(), hashlib.sha256).digest()
+        sig = base64.b64encode(hmac.new(k_date, sig_input.encode(), hashlib.sha256).digest()).decode()
+        headers = {
+            "Content-Type": "application/json",
+            "ctyun-eop-request-id": req_id,
+            "Eop-date": date,
+            "Eop-Authorization": f"{self.ak} Headers=ctyun-eop-request-id;eop-date Signature={sig}",
+            "regionid": self.region_id,
+        }
+        base_url = self.endpoint or f"https://{host}"
+        url = f"{base_url}/{path.lstrip('/')}" + (("?" + qs) if qs else "")
+        data = body_str.encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return json.loads(e.read())
+
+
+def latest_connectors_image(client: CtyunClient, region_id: str, project_id: str) -> dict:
+    images = []
+    for page in range(1, 20):
+        log(f"listing private images page {page}")
+        r = client.call(
+            "ctimage-global.ctapi.ctyun.cn",
+            "/v4/image/list",
+            method="GET",
+            query={
+                "regionID": region_id,
+                "projectID": project_id,
+                "visibility": 0,
+                "pageNo": page,
+                "pageSize": 50,
+            },
+        )
+        if r.get("statusCode") != 800:
+            die(f"image list failed: {json.dumps(r, ensure_ascii=False)}")
+        ret = r.get("returnObj") or {}
+        images.extend(ret.get("images") or [])
+        if page >= int(ret.get("totalPage") or page):
+            break
+    matches = [
+        i for i in images
+        if (i.get("imageName") or "").startswith("connectors-int-vm")
+        and i.get("status") == "active"
+        and i.get("imageVisibilityCode") == 0
+    ]
+    if not matches:
+        die("no active private connectors-int-vm image found")
+    matches.sort(key=lambda i: i.get("createdTime") or 0, reverse=True)
+    return matches[0]
+
+
+def generate_keypair(export_dir: Path, vm_name: str) -> tuple[Path, str]:
+    key_path = export_dir / "ssh_key"
+    pub_path = Path(str(key_path) + ".pub")
+    if not key_path.exists():
+        log(f"generating ssh keypair: {key_path}")
+        r = run(
+            ["ssh-keygen", "-t", "ed25519", "-f", str(key_path), "-N", "", "-C", f"{vm_name}@connectors-int-vm"],
+            timeout=30,
+        )
+        if r.returncode != 0:
+            die(f"ssh-keygen failed: {r.stderr.strip()}")
+    else:
+        log(f"reusing ssh keypair: {key_path}")
+    key_path.chmod(0o600)
+    return key_path, pub_path.read_text().strip()
+
+
+def render_userdata(pubkey: str, ssh_user: str) -> str:
+    tools = "\n".join(f"      {tool}" for tool in TOOLS_ENABLED)
+    body = f"""#cloud-config
+users:
+  - name: {ssh_user}
+    ssh_authorized_keys:
+      - {pubkey}
+write_files:
+  - path: /etc/connectors-int-vm/tools_enabled
+    permissions: '0644'
+    content: |
+{tools}
+"""
+    return base64.b64encode(body.encode()).decode()
+
+
+def load_or_create_client_token(export_dir: Path, vm_name: str, image_id: str, subnet_id: str) -> str:
+    state_file = export_dir / "launch-state.json"
+    if state_file.exists():
+        state = json.loads(state_file.read_text())
+        token = state.get("clientToken")
+        if token:
+            log(f"reusing clientToken from {state_file}")
+            return token
+
+    token = hashlib.sha256(f"{vm_name}-{image_id}-{subnet_id}-{uuid.uuid4()}".encode()).hexdigest()[:32]
+    state_file.write_text(json.dumps({
+        "vmName": vm_name,
+        "imageID": image_id,
+        "subnetID": subnet_id,
+        "clientToken": token,
+        "createdAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }, ensure_ascii=False, indent=2))
+    state_file.chmod(0o600)
+    log(f"created clientToken state: {state_file}")
+    return token
+
+
+def create_instance(client: CtyunClient, cfg: dict, vm_name: str, image: dict, pubkey: str, export_dir: Path) -> str:
+    ctyun = cfg["ctyun"]
+    network = cfg["network"]
+    instance = cfg["instance"]
+    project_id = str(instance.get("projectID", "0"))
+    ssh_user = (cfg.get("cloudInit") or {}).get("sshUser", "root")
+    image_id = image["imageID"]
+    client_token = load_or_create_client_token(export_dir, vm_name, image_id, network["subnetID"])
+    body = {
+        "clientToken": client_token,
+        "regionID": ctyun["regionID"],
+        "instanceName": vm_name,
+        "displayName": vm_name,
+        "flavorName": instance["flavorName"],
+        "imageType": int(image.get("imageVisibilityCode", instance.get("imageType", 0))),
+        "imageID": image_id,
+        "bootDiskType": instance["bootDisk"]["type"],
+        "bootDiskSize": max(int(instance["bootDisk"]["size"]), int(image.get("diskSize") or 0)),
+        "onDemand": bool(instance.get("onDemand", True)),
+        "extIP": str(network.get("extIP", "0")),
+        "secGroupList": [network["securityGroupID"]],
+        "networkCardList": [{"subnetID": network["subnetID"], "isMaster": True}],
+        "userData": render_userdata(pubkey, ssh_user),
+        "projectID": project_id,
+        "vpcID": network["vpcID"],
+    }
+    if ctyun.get("azName"):
+        body["azName"] = ctyun["azName"]
+    log(f"creating or reusing CTYun instance name={vm_name} imageID={image_id}")
+    r = client.call("ctecs-global.ctapi.ctyun.cn", "/v4/ecs/create-instance", method="POST", body=body)
+    if r.get("statusCode") != 800:
+        die(f"create-instance failed: {json.dumps(r, ensure_ascii=False)}")
+    order_id = (r.get("returnObj") or {}).get("masterOrderID")
+    if not order_id:
+        die(f"create-instance returned no masterOrderID: {json.dumps(r, ensure_ascii=False)}")
+    log(f"create-instance accepted; masterOrderID={order_id}")
+    for i in range(30):
+        q = client.call(
+            "ctecs-global.ctapi.ctyun.cn",
+            "/v4/ecs/order/query-uuid",
+            method="GET",
+            query={"masterOrderID": order_id},
+        )
+        status = (q.get("returnObj") or {}).get("orderStatus")
+        ids = ((q.get("returnObj") or {}).get("instanceIDList") or [])
+        if ids:
+            log(f"order resolved; orderStatus={status} instanceID={ids[0]}")
+            return ids[0]
+        log(f"waiting for instanceID; poll={i + 1}/30 orderStatus={status}")
+        time.sleep(10)
+    die(f"order {order_id} did not resolve to an instanceID within 300s")
+
+
+def describe_ip(client: CtyunClient, region_id: str, project_id: str, instance_id: str) -> str:
+    log(f"describing instance IP: {instance_id}")
+    r = client.call(
+        "ctecs-global.ctapi.ctyun.cn",
+        "/v4/ecs/describe-instances",
+        method="POST",
+        body={
+            "regionID": region_id,
+            "projectID": project_id,
+            "instanceIDList": instance_id,
+            "pageNo": 1,
+            "pageSize": 10,
+        },
+    )
+    items = (r.get("returnObj") or {}).get("results") or []
+    if not items:
+        die(f"instance {instance_id} not found")
+    obj = items[0]
+    for vpc in obj.get("addresses") or []:
+        for addr in vpc.get("addressList") or []:
+            if addr.get("version") == 4 and addr.get("isMaster"):
+                log(f"instance IP resolved: {addr['addr']}")
+                return addr["addr"]
+    for ni in obj.get("networkInfo") or []:
+        if ni.get("ipAddress"):
+            log(f"instance IP resolved: {ni['ipAddress']}")
+            return ni["ipAddress"]
+    die(f"no IPv4 address found for instance {instance_id}")
+
+
+def ssh_cmd(ip: str, key_path: Path, user: str, remote_cmd: str) -> list[str]:
+    return [
+        "ssh",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10",
+        "-i", str(key_path),
+        f"{user}@{ip}",
+        remote_cmd,
+    ]
+
+
+def wait_ssh(ip: str, key_path: Path, user: str, timeout_sec: int = 600) -> None:
+    log(f"waiting for SSH: {user}@{ip}")
+    deadline = time.time() + timeout_sec
+    last = ""
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        r = run(ssh_cmd(ip, key_path, user, "true"), timeout=20)
+        if r.returncode == 0:
+            log("SSH is ready")
+            return
+        last = (r.stderr or r.stdout).strip()
+        log(f"SSH not ready; attempt={attempt} rc={r.returncode} last={last[-160:]}")
+        time.sleep(10)
+    die(
+        f"ssh did not become ready within {timeout_sec}s: {last}\n"
+        "If you reused an existing vm_name with a different export root, CTYun "
+        "may have returned the already-created VM while this run generated a "
+        "new SSH key. Reuse the original <export_dir>/<vm_name>/ssh_key, choose a new vm_name, "
+        "or delete the existing VM before retrying."
+    )
+
+
+def export_kubeconfig(ip: str, key_path: Path, user: str, out_path: Path) -> None:
+    log(f"exporting kubeconfig: {out_path}")
+    r = run(ssh_cmd(ip, key_path, user, "cat /etc/rancher/k3s/k3s.yaml"), timeout=30)
+    if r.returncode != 0:
+        die(f"failed to read kubeconfig: {r.stderr.strip()}")
+    cfg = yaml.safe_load(r.stdout)
+    for cluster in cfg.get("clusters", []):
+        c = cluster.setdefault("cluster", {})
+        c["server"] = f"https://{ip}:6443"
+        c["insecure-skip-tls-verify"] = True
+        c.pop("certificate-authority-data", None)
+    out_path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    out_path.chmod(0o600)
+
+
+def export_manifest(ip: str, key_path: Path, user: str, out_path: Path) -> None:
+    log(f"exporting manifest: {out_path}")
+    r = run(
+        ssh_cmd(ip, key_path, user, "cat /var/lib/connectors-int-vm/build-artifacts/manifest.json"),
+        timeout=30,
+    )
+    if r.returncode != 0:
+        die(f"failed to read manifest.json: {r.stderr.strip()}")
+    out_path.write_text(r.stdout)
+
+
+def registry_auth_from_cfg(cfg: dict) -> str | None:
+    value = (cfg.get("registry") or {}).get("authBase64") or os.environ.get("CTYUN_VM_REGISTRY_AUTH_B64")
+    return str(value) if value else None
+
+
+def validate_registry_server(server: str) -> str:
+    if (not isinstance(server, str) or not server or server.strip() != server or
+            "://" in server or "/" in server or "@" in server or
+            any(c in server for c in "?#[]")):
+        raise ValueError("registry server must be host[:port] without scheme, path, or credentials")
+    host, sep, port = server.rpartition(":")
+    if sep and (not host or not port.isdigit() or not (1 <= int(port) <= 65535)):
+        raise ValueError("registry server port must be between 1 and 65535")
+    candidate = host if sep else server
+    if not candidate or any(not (part and all(ch.isalnum() or ch == "-" for ch in part)) for part in candidate.split(".")):
+        raise ValueError("invalid registry server host")
+    return server
+
+
+def registry_defaults_from_cfg(cfg: dict) -> list[dict]:
+    raw = (cfg.get("registry") or {}).get("defaults") or []
+    if not isinstance(raw, list):
+        raise ValueError("registry.defaults must be a list")
+    result = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise ValueError("each registry default must be a mapping")
+        server = validate_registry_server(item.get("server"))
+        username, password = item.get("username"), item.get("password")
+        skip_verify = item.get("skipVerify", False)
+        if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
+            raise ValueError(f"registry credentials must be non-empty for {server}")
+        if not isinstance(skip_verify, bool):
+            raise ValueError(f"registry skipVerify must be boolean for {server}")
+        result.append({"server": server, "username": username, "password": password,
+                       "skipVerify": skip_verify})
+    return result
+
+
+def registry_entry_from_cfg(cfg: dict, server: str) -> dict:
+    server = validate_registry_server(server)
+    matches = [entry for entry in registry_defaults_from_cfg(cfg) if entry["server"] == server]
+    if len(matches) != 1:
+        raise ValueError(f"registry default must uniquely match server: {server}")
+    return matches[0]
+
+
+def _registry_connection(export_root: Path, target: str | None):
+    record = resolve_ssh_record(export_root, target)
+    local_dir = Path(record["localDir"]).resolve()
+    if local_dir.parent != export_root.resolve():
+        raise ValueError("local VM state directory escapes state root")
+    key = local_dir / "ssh_key"
+    if key.is_symlink() or not key.is_file():
+        raise ValueError(f"SSH key not found: {key}")
+    ip = record.get("ip")
+    if not ip:
+        raise ValueError("VM record has no IP address")
+    key.chmod(0o600)
+    return record, local_dir, ip, key
+
+
+def _wait_registry_ready(ip, local_dir, wait_ready):
+    kubeconfig = local_dir / "kubeconfig.yaml"
+    if kubeconfig.is_file():
+        wait_ready(ip, kubeconfig)
+
+
+def registry_configure(export_root: Path, target: str | None, user: str, entry: dict, *,
+                       run_cmd=run, wait_ready=None) -> None:
+    wait_ready = wait_ready or wait_node_internal_ip
+    server = validate_registry_server(entry["server"])
+    _, local_dir, ip, key = _registry_connection(export_root, target)
+    auth = base64.b64encode(f'{entry["username"]}:{entry["password"]}'.encode()).decode()
+    skip = "true" if entry.get("skipVerify", False) else "false"
+    script = f'''set -euo pipefail
+server={shlex.quote(server)}
+auth={shlex.quote(auth)}
+stamp=$(date +%Y%m%d%H%M%S)
+for base in /etc/containerd/certs.d /var/lib/rancher/k3s/agent/etc/containerd/certs.d; do
+  dir="$base/$server"; file="$dir/hosts.toml"; mkdir -p "$dir"
+  [ ! -f "$file" ] || cp -a "$file" "$file.bak.$stamp"
+  tmp=$(mktemp "$file.tmp.XXXXXX")
+  cat >"$tmp" <<EOF
+server = "https://$server"
+[host."https://$server"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = {skip}
+  [host."https://$server".header]
+    authorization = "Basic $auth"
+EOF
+  chmod 0600 "$tmp"; mv "$tmp" "$file"
+done
+if systemctl is-active --quiet k3s; then systemctl restart k3s
+elif systemctl is-active --quiet containerd; then systemctl restart containerd; fi
+'''
+    result = run_cmd(ssh_cmd(ip, key, user, "bash -s"), input_text=script, timeout=90)
+    if result.returncode:
+        raise ValueError("failed to configure registry credentials on VM")
+    _wait_registry_ready(ip, local_dir, wait_ready)
+
+
+def registry_list(export_root: Path, target: str | None, user: str, *, run_cmd=run) -> list[dict]:
+    _, _, ip, key = _registry_connection(export_root, target)
+    remote = "for d in /etc/containerd/certs.d/* /var/lib/rancher/k3s/agent/etc/containerd/certs.d/*; do [ -d \"$d\" ] || continue; printf '%s\\t%s\\n' \"${d##*/}\" \"$([ -f \"$d/hosts.toml\" ] && echo true || echo false)\"; done | sort -u"
+    result = run_cmd(ssh_cmd(ip, key, user, remote), timeout=30)
+    if result.returncode:
+        raise ValueError("failed to list configured registries")
+    rows = []
+    for line in result.stdout.splitlines():
+        server, present = line.split("\t", 1)
+        rows.append({"server": server, "hostsToml": present == "true"})
+    return rows
+
+
+def registry_remove(export_root: Path, target: str | None, user: str, server: str, yes: bool, *,
+                    run_cmd=run, wait_ready=None, input_fn=input) -> None:
+    wait_ready = wait_ready or wait_node_internal_ip
+    server = validate_registry_server(server)
+    if not yes and input_fn(f"Remove registry configuration for {server}? Type yes: ").strip().lower() != "yes":
+        raise ValueError("registry removal cancelled")
+    _, local_dir, ip, key = _registry_connection(export_root, target)
+    script = f'''set -euo pipefail
+server={shlex.quote(server)}
+for base in /etc/containerd/certs.d /var/lib/rancher/k3s/agent/etc/containerd/certs.d; do
+  dir="$base/$server"; file="$dir/hosts.toml"
+  [ ! -f "$file" ] || rm -- "$file"
+  rmdir -- "$dir" 2>/dev/null || true
+done
+if systemctl is-active --quiet k3s; then systemctl restart k3s
+elif systemctl is-active --quiet containerd; then systemctl restart containerd; fi
+'''
+    result = run_cmd(ssh_cmd(ip, key, user, "bash -s"), input_text=script, timeout=90)
+    if result.returncode:
+        raise ValueError("failed to remove registry configuration from VM")
+    _wait_registry_ready(ip, local_dir, wait_ready)
+
+
+def configure_registry_defaults(cfg: dict, export_root: Path, target: str, user: str, *,
+                                configure=registry_configure, wait_ready=None) -> None:
+    for entry in registry_defaults_from_cfg(cfg):
+        configure(export_root, target, user, entry, wait_ready=wait_ready)
+
+
+def configure_registry(ip: str, key_path: Path, user: str, auth_b64: str) -> None:
+    log(f"configuring k3s registry credentials for {REGISTRY}")
+    node_script = f"""set -euo pipefail
+REGISTRY={shlex.quote(REGISTRY)}
+AUTH_B64={shlex.quote(auth_b64)}
+STAMP="$(date +%Y%m%d%H%M%S)"
+CONFIG_BASE_DIRS=(/etc/containerd/certs.d)
+if [[ -d /var/lib/rancher/k3s/agent/etc/containerd ]] || [[ -S /run/k3s/containerd/containerd.sock ]]; then
+  CONFIG_BASE_DIRS+=(/var/lib/rancher/k3s/agent/etc/containerd/certs.d)
+fi
+for base_dir in "${{CONFIG_BASE_DIRS[@]}}"; do
+  config_dir="${{base_dir}}/${{REGISTRY}}"
+  hosts_file="${{config_dir}}/hosts.toml"
+  mkdir -p "$config_dir"
+  chmod 0755 "$base_dir" "$config_dir"
+  if [[ -f "$hosts_file" ]]; then
+    cp -a "$hosts_file" "${{hosts_file}}.bak.${{STAMP}}"
+  fi
+  tmp="$(mktemp "${{hosts_file}}.tmp.XXXXXX")"
+  cat >"$tmp" <<EOF_HOSTS
+server = "https://${{REGISTRY}}"
+
+[host."https://${{REGISTRY}}"]
+  capabilities = ["pull", "resolve"]
+  skip_verify = true
+
+  [host."https://${{REGISTRY}}".header]
+    authorization = "Basic ${{AUTH_B64}}"
+EOF_HOSTS
+  chmod 0600 "$tmp"
+  mv "$tmp" "$hosts_file"
+done
+if command -v systemctl >/dev/null 2>&1 && systemctl is-active k3s >/dev/null 2>&1; then
+  systemctl restart k3s
+elif command -v systemctl >/dev/null 2>&1 && systemctl is-active containerd >/dev/null 2>&1; then
+  systemctl restart containerd
+fi
+"""
+    r = run(ssh_cmd(ip, key_path, user, "bash -s"), input_text=node_script, timeout=90)
+    if r.returncode != 0:
+        die(f"failed to configure k3s registry credentials: {r.stderr.strip()}")
+    log("registry credentials configured")
+
+
+def wait_node_internal_ip(ip: str, kubeconfig: Path, timeout_sec: int = 600) -> None:
+    log(f"waiting for node InternalIP to become {ip}")
+    deadline = time.time() + timeout_sec
+    last = ""
+    attempt = 0
+    while time.time() < deadline:
+        attempt += 1
+        r = run(
+            [
+                "kubectl",
+                "--kubeconfig", str(kubeconfig),
+                "get", "node", "vm1",
+                "-o", "jsonpath={.status.addresses[?(@.type==\"InternalIP\")].address}",
+            ],
+            timeout=20,
+        )
+        if r.returncode == 0:
+            last = r.stdout.strip()
+            if last == ip:
+                log(f"node InternalIP is ready: {last}")
+                return
+        else:
+            last = (r.stderr or r.stdout).strip()
+        log(f"node InternalIP not ready; attempt={attempt} current={last}")
+        time.sleep(10)
+    die(f"node InternalIP did not become {ip} within {timeout_sec}s; last value: {last}")
+
+
+def write_patch_hosts(export_dir: Path, ip: str) -> Path:
+    path = export_dir / "patch-hosts.sh"
+    log(f"writing patch-hosts script: {path}")
+    hosts = " ".join(TOOL_HOSTS)
+    path.write_text(f"""#!/usr/bin/env bash
+set -euo pipefail
+IP={shlex.quote(ip)}
+HOSTS={shlex.quote(hosts)}
+MARK_BEGIN="# start-devops-ctyun-vm begin"
+MARK_END="# start-devops-ctyun-vm end"
+TMP="$(mktemp)"
+sudo awk -v begin="$MARK_BEGIN" -v end="$MARK_END" '
+  $0 == begin {{skip=1; next}}
+  $0 == end {{skip=0; next}}
+  !skip {{print}}
+' /etc/hosts >"$TMP"
+{{
+  echo "$MARK_BEGIN"
+  for h in $HOSTS; do
+    echo "$IP $h"
+  done
+  echo "$MARK_END"
+}} >>"$TMP"
+sudo cp "$TMP" /etc/hosts
+rm -f "$TMP"
+echo "patched /etc/hosts for: $HOSTS"
+""")
+    path.chmod(0o755)
+    return path
+
+
+def secure_dir(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o700)
+    return path
+
+
+def load_local_records(export_root: Path) -> list[dict]:
+    root = export_root.resolve()
+    if not root.is_dir():
+        return []
+    records = []
+    for child in sorted(root.iterdir()):
+        if child.is_symlink() or not child.is_dir() or child.name.startswith("."):
+            continue
+        metadata = child / "instance.json"
+        if not metadata.is_file():
+            continue
+        try:
+            obj = json.loads(metadata.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(obj, dict) and obj.get("instanceID"):
+            obj = dict(obj)
+            obj["localDir"] = str(child)
+            records.append(obj)
+    return records
+
+
+def _value(obj: dict, *names):
+    for name in names:
+        if obj.get(name) is not None:
+            return obj[name]
+    return None
+
+
+def _is_controlled_instance(obj: dict) -> bool:
+    labels = obj.get("labels") if isinstance(obj.get("labels"), dict) else {}
+    owner = _value(obj, "owner", "Owner") or labels.get("owner")
+    creator = _value(obj, "createdBy", "created-by", "creator") or labels.get("created-by") or labels.get("createdBy")
+    # The API normally applies labelList server-side but does not echo labels
+    # in every response shape. If it does echo ownership, verify it again.
+    if owner is None and creator is None:
+        return True
+    return owner == "kychen" and creator == "ctyun-relay"
+
+
+def list_controlled_instances(client: CtyunClient, region_id: str, project_id: str) -> list[dict]:
+    found = []
+    page = 1
+    while True:
+        response = client.call(
+            "ctecs-global.ctapi.ctyun.cn", "/v4/ecs/list-instances", method="POST",
+            body={"regionID": region_id, "projectID": project_id, "pageNo": page, "pageSize": 50,
+                  "labelList": [
+                      {"labelKey": "owner", "labelValue": "kychen"},
+                      {"labelKey": "created-by", "labelValue": "ctyun-relay"},
+                  ]},
+        )
+        if response.get("statusCode") != 800:
+            code = response.get("errorCode") or response.get("error") or "unknown"
+            message = response.get("message") or response.get("description") or ""
+            die(f"list-instances failed: {code} {message}".rstrip())
+        result = response.get("returnObj") or {}
+        items = result.get("results") or result.get("instances") or []
+        found.extend(item for item in items if isinstance(item, dict) and _is_controlled_instance(item))
+        total_pages = int(result.get("totalPage") or result.get("totalPages") or page)
+        if page >= total_pages:
+            break
+        page += 1
+    return found
+
+
+def remote_owner_from_cfg(cfg: dict) -> str:
+    ctyun = cfg.get("ctyun")
+    owner = ctyun.get("owner") if isinstance(ctyun, dict) else None
+    if (not isinstance(owner, str) or not owner or owner != owner.strip()
+            or len(owner) > 128 or any(ord(ch) < 33 or ord(ch) == 127 for ch in owner)):
+        raise ValueError("config must include a valid non-empty ctyun.owner")
+    return owner
+
+
+def _remote_ip(obj: dict) -> str | None:
+    direct = _value(obj, "privateIP", "privateIp", "ip", "IP")
+    if isinstance(direct, str) and direct:
+        return direct
+    for field in ("addresses", "networkInfo"):
+        value = obj.get(field)
+        candidates = value if isinstance(value, list) else ([value] if isinstance(value, dict) else [])
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            ip = _value(candidate, "privateIP", "privateIp", "ip", "address", "fixedIp", "fixedIP")
+            if isinstance(ip, str) and ip:
+                return ip
+    return None
+
+
+def normalize_remote_instance(obj: dict) -> dict:
+    flavor = obj.get("flavor") if isinstance(obj.get("flavor"), dict) else {}
+    cpu = _value(flavor, "flavorCPU", "cpu") or _value(obj, "flavorCPU")
+    ram_mib = _value(flavor, "flavorRAM", "ram") or _value(obj, "flavorRAM")
+    memory_gib = None
+    if isinstance(ram_mib, (int, float)) and not isinstance(ram_mib, bool):
+        memory_gib = ram_mib / 1024
+        if memory_gib.is_integer():
+            memory_gib = int(memory_gib)
+    volumes = obj.get("attachedVolume")
+    disk_count = len(volumes) if isinstance(volumes, list) else None
+    image_obj = obj.get("image") if isinstance(obj.get("image"), dict) else {}
+    image_name = _value(obj, "imageName") or _value(image_obj, "imageName", "name")
+
+    def date_only(value):
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if (len(value) >= 10 and value[4:5] == "-" and value[7:8] == "-"
+                and value[:4].isdigit() and value[5:7].isdigit() and value[8:10].isdigit()):
+            return value[:10]
+        return None
+
+    return {
+        "vmName": _value(obj, "displayName", "instanceName", "name"),
+        "instanceID": _value(obj, "instanceID", "instanceId", "id"),
+        "status": _value(obj, "instanceStatus", "status"),
+        "ip": _remote_ip(obj),
+        "cpu": cpu if isinstance(cpu, (int, float)) and not isinstance(cpu, bool) else None,
+        "memoryGiB": memory_gib,
+        "diskCount": disk_count,
+        "image": image_name if isinstance(image_name, str) else None,
+        "az": _value(obj, "azName", "availabilityZone"),
+        "vpc": _value(obj, "vpcName", "vpc"),
+        "created": date_only(_value(obj, "createdTime", "createTime")),
+        "expires": date_only(_value(obj, "expiredTime", "expireTime")),
+    }
+
+
+def list_remote_instances(client: CtyunClient, region_id: str, project_id: str,
+                          owner: str) -> list[dict]:
+    # Validate even when called outside the CLI; owner is security-significant.
+    owner = remote_owner_from_cfg({"ctyun": {"owner": owner}})
+    found = []
+    page = 1
+    while True:
+        response = client.call(
+            "ctecs-global.ctapi.ctyun.cn", "/v4/ecs/list-instances", method="POST",
+            body={"regionID": region_id, "projectID": project_id, "pageNo": page,
+                  "pageSize": 50, "labelList": [{"labelKey": "owner", "labelValue": owner}]},
+        )
+        if not isinstance(response, dict) or response.get("statusCode") != 800:
+            code = response.get("errorCode") if isinstance(response, dict) else None
+            raise ValueError(f"remote list request failed: {code or 'unknown'}")
+        result = response.get("returnObj") or {}
+        items = result.get("results") or result.get("instances") or []
+        found.extend(normalize_remote_instance(item) for item in items if isinstance(item, dict))
+        total_pages = int(result.get("totalPage") or result.get("totalPages") or page)
+        if page >= total_pages:
+            return found
+        page += 1
+
+
+def find_remote_record(records: list[dict], target: str) -> dict:
+    id_matches = [record for record in records if record.get("instanceID") == target]
+    if len(id_matches) == 1:
+        return id_matches[0]
+    matches = [record for record in records if record.get("vmName") == target]
+    if not matches:
+        raise ValueError(f"remote VM not found: {target}")
+    if len(matches) != 1:
+        raise ValueError(f"ambiguous remote VM name: {target}; use instance ID")
+    return matches[0]
+
+
+def remote_delete_vm(client: CtyunClient, export_root: Path, target: str,
+                     region_id: str, project_id: str, owner: str, *,
+                     assume_yes: bool = False, timeout_sec: int = 600) -> dict:
+    records = list_remote_instances(client, region_id, project_id, owner)
+    record = find_remote_record(records, target)
+    instance_id = record["instanceID"]
+    if any(local.get("instanceID") == instance_id for local in load_local_records(export_root)):
+        raise ValueError(
+            f"refusing remote delete: local state exists; use ctyun-vm delete {instance_id}"
+        )
+
+    print_records([record])
+    _confirm("Release this owned cloud VM?", assume_yes)
+    response = client.call(
+        "ctecs-global.ctapi.ctyun.cn",
+        f"/relay/v1/instances/{instance_id}/release",
+        method="POST", body={},
+    )
+    if (not isinstance(response, dict) or response.get("statusCode") == 900
+            or response.get("success") is False):
+        raise RuntimeError("release request failed")
+
+    deadline = time.monotonic() + timeout_sec
+    missing_count = 0
+    while time.monotonic() < deadline:
+        current = list_remote_instances(client, region_id, project_id, owner)
+        if any(item.get("instanceID") == instance_id for item in current):
+            missing_count = 0
+        else:
+            missing_count += 1
+            if missing_count >= 2:
+                described = client.call(
+                    "ctecs-global.ctapi.ctyun.cn", "/v4/ecs/describe-instances",
+                    method="POST",
+                    body={"regionID": region_id, "projectID": project_id,
+                          "instanceIDList": instance_id, "pageNo": 1, "pageSize": 10},
+                )
+                if isinstance(described, dict) and described.get("statusCode") == 800:
+                    details = (described.get("returnObj") or {}).get("results") or []
+                    if not details:
+                        return record
+                elif isinstance(described, dict) and described.get("statusCode") == 900:
+                    code = str(described.get("errorCode") or "").lower()
+                    if "notfound" in code or "not_found" in code or "not found" in code:
+                        return record
+                missing_count = 0
+        time.sleep(5)
+    raise TimeoutError("release not confirmed before timeout")
+
+
+def find_local_record(export_root: Path, target: str) -> dict:
+    matches = [r for r in load_local_records(export_root)
+               if r.get("vmName") == target or r.get("instanceID") == target]
+    if len(matches) != 1:
+        raise ValueError(f"VM not found in local records: {target}" if not matches else f"ambiguous VM: {target}")
+    return matches[0]
+
+
+def resolve_ssh_record(export_root: Path, target: str | None) -> dict:
+    records = load_local_records(export_root)
+    if target is not None:
+        return find_local_record(export_root, target)
+    if not records:
+        raise ValueError("No local VMs found.")
+    if len(records) != 1:
+        candidates = ", ".join(str(r.get("vmName") or r.get("instanceID")) for r in records)
+        raise ValueError(f"Multiple local VMs found; specify one of: {candidates}")
+    return records[0]
+
+
+def ssh_vm(export_root: Path, target: str | None, ssh_user: str,
+           remote_argv: list[str], *, execvp=os.execvp) -> None:
+    record = resolve_ssh_record(export_root, target)
+    local_dir_path = Path(record["localDir"])
+    if local_dir_path.is_symlink():
+        raise ValueError("unsafe local VM state directory")
+    local_dir = local_dir_path.resolve()
+    if local_dir.parent != export_root.resolve():
+        raise ValueError("local VM state directory escapes state root")
+    ip = record.get("ip")
+    if not ip:
+        raise ValueError("VM record has no IP address")
+    key = local_dir / "ssh_key"
+    if key.is_symlink():
+        raise ValueError("unsafe SSH key: symlinks are not allowed")
+    if not key.is_file() or key.resolve().parent != local_dir:
+        raise ValueError(f"SSH key not found: {key}")
+    key.chmod(0o600)
+    argv = [
+        "ssh",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-i", str(key),
+        f"{ssh_user}@{ip}",
+        *remote_argv,
+    ]
+    execvp("ssh", argv)
+
+
+def install_kubeconfig(export_root: Path, target: str | None, ssh_user: str, *,
+                       force: bool = False, configs_dir: Path | None = None,
+                       run_cmd=subprocess.run) -> Path:
+    record = resolve_ssh_record(export_root, target)
+    local_dir_path = Path(record["localDir"])
+    if local_dir_path.is_symlink():
+        raise ValueError("unsafe local VM state directory")
+    local_dir = local_dir_path.resolve()
+    if local_dir.parent != export_root.resolve():
+        raise ValueError("local VM state directory escapes state root")
+    vm_name = valid_name(str(record.get("vmName") or ""))
+    ip = str(record.get("ip") or "")
+    if not ip:
+        raise ValueError("VM record has no IP address")
+
+    source = local_dir / "kubeconfig.yaml"
+    if source.is_symlink():
+        raise ValueError("unsafe local kubeconfig: symlinks are not allowed")
+    if source.is_file():
+        if source.resolve().parent != local_dir:
+            raise ValueError("local kubeconfig escapes VM state directory")
+        raw = source.read_text(encoding="utf-8")
+    else:
+        key = local_dir / "ssh_key"
+        if key.is_symlink():
+            raise ValueError("unsafe SSH key: symlinks are not allowed")
+        if not key.is_file() or key.resolve().parent != local_dir:
+            raise ValueError(f"SSH key not found: {key}")
+        key.chmod(0o600)
+        argv = [
+            "ssh", "-o", "IdentitiesOnly=yes", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null", "-i", str(key.resolve()),
+            f"{ssh_user}@{ip}", "cat /etc/rancher/k3s/k3s.yaml",
+        ]
+        result = run_cmd(argv, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise ValueError(f"failed to read remote kubeconfig: {result.stderr.strip()}")
+        raw = result.stdout
+
+    try:
+        config = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid kubeconfig YAML: {exc}") from exc
+    if not isinstance(config, dict) or not isinstance(config.get("clusters"), list):
+        raise ValueError("invalid kubeconfig: clusters must be a list")
+    contexts = config.get("contexts")
+    if not isinstance(contexts, list):
+        raise ValueError("invalid kubeconfig: contexts must be a list")
+    for entry in config["clusters"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("cluster"), dict):
+            raise ValueError("invalid kubeconfig: malformed cluster entry")
+    for entry in contexts:
+        if not isinstance(entry, dict) or not isinstance(entry.get("context"), dict):
+            raise ValueError("invalid kubeconfig: malformed context entry")
+
+    current_name = config.get("current-context")
+    current_matches = [entry for entry in contexts if entry.get("name") == current_name]
+    if len(current_matches) != 1:
+        if current_name in (None, "") and len(contexts) == 1 and len(config["clusters"]) == 1:
+            current = contexts[0]
+        else:
+            raise ValueError("invalid kubeconfig: current-context must uniquely identify a context")
+    else:
+        current = current_matches[0]
+    cluster_name = current["context"].get("cluster")
+    cluster_matches = [entry for entry in config["clusters"] if entry.get("name") == cluster_name]
+    if len(cluster_matches) != 1:
+        if cluster_name in (None, "") and len(contexts) == 1 and len(config["clusters"]) == 1:
+            cluster = config["clusters"][0]
+        else:
+            raise ValueError("invalid kubeconfig: current context must uniquely reference a cluster")
+    else:
+        cluster = cluster_matches[0]
+    if any(entry is not current and entry.get("name") == vm_name for entry in contexts):
+        raise ValueError(f"invalid kubeconfig: context name conflicts with VM name: {vm_name}")
+    if any(entry is not cluster and entry.get("name") == vm_name for entry in config["clusters"]):
+        raise ValueError(f"invalid kubeconfig: cluster name conflicts with VM name: {vm_name}")
+    cluster["name"] = vm_name
+    cluster["cluster"]["server"] = f"https://{ip}:6443"
+    cluster["cluster"]["insecure-skip-tls-verify"] = True
+    cluster["cluster"].pop("certificate-authority-data", None)
+    current["name"] = vm_name
+    current["context"]["cluster"] = vm_name
+    config["current-context"] = vm_name
+    rendered = yaml.safe_dump(config, sort_keys=False)
+
+    destination_dir = configs_dir if configs_dir is not None else Path.home() / ".kube/configs"
+    destination_dir = destination_dir.expanduser()
+    if destination_dir.is_symlink():
+        raise ValueError("unsafe kubeconfig destination directory: symlinks are not allowed")
+    destination_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if destination_dir.is_symlink() or not destination_dir.is_dir():
+        raise ValueError("unsafe kubeconfig destination directory")
+    destination_dir.chmod(0o700)
+    destination_root = destination_dir.resolve()
+    destination = destination_dir / f"ctyun-vm-{vm_name}.yaml"
+    if destination.is_symlink():
+        raise ValueError("unsafe kubeconfig destination: symlinks are not allowed")
+    if destination.resolve().parent != destination_root:
+        raise ValueError("kubeconfig destination escapes destination directory")
+    if destination.exists() and not force:
+        raise FileExistsError(f"kubeconfig already exists: {destination}; use --force to overwrite")
+
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination_dir)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1
+            stream.write(rendered)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if destination.is_symlink():
+            raise ValueError("unsafe kubeconfig destination: symlinks are not allowed")
+        os.replace(temporary, destination)
+        destination.chmod(0o600)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def find_cloud_record(records: list[dict], target: str) -> dict:
+    matches = [r for r in records if r.get("instanceID") == target or
+               _value(r, "displayName", "instanceName") == target]
+    if len(matches) != 1:
+        raise ValueError(f"cloud VM not found: {target}" if not matches else f"ambiguous cloud VM: {target}")
+    return matches[0]
+
+
+def merge_local_cloud(local: list[dict], cloud: list[dict]) -> list[dict]:
+    by_id = {x.get("instanceID"): x for x in cloud}
+    result = [{**record, "status": _value(by_id.get(record["instanceID"], {}),
+                                           "status", "instanceStatus") or "not-found"}
+              for record in local]
+    return result
+
+
+def print_records(records: list[dict], *, as_json: bool = False) -> None:
+    safe = [{k: r.get(k) for k in ("archiveName", "vmName", "instanceID", "ip", "status", "localDir") if r.get(k) is not None}
+            for r in records]
+    if as_json:
+        print(json.dumps(safe, ensure_ascii=False, indent=2))
+        return
+    if not safe:
+        print("No VM records found.")
+        return
+    print(f"{'NAME':40} {'INSTANCE ID':38} {'STATUS':16} IP")
+    for r in safe:
+        print(f"{str(r.get('archiveName') or r.get('vmName', '-')):40} {str(r.get('instanceID', '-')):38} "
+              f"{str(r.get('status', '-')):16} {r.get('ip', '-')}")
+
+
+def print_remote_records(records: list[dict], *, as_json: bool = False,
+                         wide: bool = False) -> None:
+    keys = ("vmName", "instanceID", "status", "ip", "cpu", "memoryGiB",
+            "diskCount", "image", "az", "vpc", "created", "expires")
+    safe = [{key: record.get(key) for key in keys} for record in records]
+    if as_json:
+        print(json.dumps(safe, ensure_ascii=False, indent=2))
+        return
+    if not safe:
+        print("No remote VM records found.")
+        return
+
+    def value(value):
+        return "-" if value is None or value == "" else str(value)
+
+    def spec(record):
+        cpu, memory = record.get("cpu"), record.get("memoryGiB")
+        return f"{cpu}C/{memory:g}GiB" if cpu is not None and memory is not None else "-"
+
+    def disks(record):
+        count = record.get("diskCount")
+        return "-" if count is None else f"{count} {'vol' if count == 1 else 'vols'}"
+
+    if wide:
+        columns = [("NAME", lambda r: value(r.get("vmName"))),
+                   ("INSTANCE ID", lambda r: value(r.get("instanceID"))),
+                   ("STATUS", lambda r: value(r.get("status"))),
+                   ("IP", lambda r: value(r.get("ip"))), ("SPEC", spec),
+                   ("DISKS", disks), ("IMAGE", lambda r: value(r.get("image"))),
+                   ("AZ", lambda r: value(r.get("az"))), ("VPC", lambda r: value(r.get("vpc"))),
+                   ("CREATED", lambda r: value(r.get("created"))),
+                   ("EXPIRES", lambda r: value(r.get("expires")))]
+    else:
+        columns = [("NAME", lambda r: value(r.get("vmName"))),
+                   ("STATUS", lambda r: value(r.get("status"))),
+                   ("IP", lambda r: value(r.get("ip"))), ("SPEC", spec),
+                   ("DISKS", disks), ("CREATED", lambda r: value(r.get("created")))]
+    rendered = [[getter(record) for _, getter in columns] for record in safe]
+    widths = [max(len(header), *(len(row[index]) for row in rendered))
+              for index, (header, _) in enumerate(columns)]
+    print("  ".join(header.ljust(widths[index]) for index, (header, _) in enumerate(columns)))
+    for row in rendered:
+        print("  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)).rstrip())
+
+
+def _quota_number(value, field: str):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"invalid quota numeric field: {field}")
+    return value
+
+
+def normalize_quota(response: dict) -> list[dict]:
+    """Normalize only documented/explicit relay quota shapes without echoing input."""
+    if not isinstance(response, dict):
+        raise ValueError("unrecognized quota response structure")
+    confirmed = (
+        ("vCPU", "cores", "vcpu"),
+        ("Memory", "GiB", "mem_gb"),
+        ("Disk", "GiB", "disk_gb"),
+    )
+    if all(isinstance(response.get(key), dict) for _, _, key in confirmed):
+        rows = []
+        for resource, unit, key in confirmed:
+            item = response[key]
+            used = _quota_number(item.get("used"), f"{resource}.used")
+            limit = _quota_number(item.get("limit"), f"{resource}.limit")
+            available = _quota_number(item.get("available"), f"{resource}.available")
+            rows.append({"resource": resource, "used": used, "limit": limit,
+                         "available": available, "unit": unit})
+        return rows
+    definitions = (
+        ("vCPU", "vCPU", ("vcpu", "vCPU"), ()),
+        ("Memory", "GiB", ("memoryGiB",), ("memory", "mem")),
+        ("Disk", "GiB", ("diskGiB",), ("disk",)),
+    )
+    rows = []
+    limits, usage = response.get("limits"), response.get("usage")
+    if isinstance(limits, dict) and isinstance(usage, dict):
+        for resource, unit, exact_keys, legacy_keys in definitions:
+            keys = exact_keys + legacy_keys
+            key = next((name for name in keys if name in limits and name in usage), None)
+            if key is None:
+                raise ValueError("unrecognized quota response structure")
+            limit = _quota_number(limits[key], f"{resource}.limit")
+            used = _quota_number(usage[key], f"{resource}.used")
+            rows.append({"resource": resource, "used": used, "limit": limit,
+                         "available": max(0, limit - used), "unit": unit})
+        return rows
+    resources = response.get("resources")
+    if isinstance(resources, list):
+        by_name = {}
+        aliases = {"vcpu": "vCPU", "memory": "Memory", "mem": "Memory", "disk": "Disk"}
+        expected_units = {"vCPU": "vCPU", "Memory": "GiB", "Disk": "GiB"}
+        for item in resources:
+            if not isinstance(item, dict):
+                raise ValueError("unrecognized quota response structure")
+            canonical = aliases.get(str(item.get("resource", "")).lower())
+            if canonical and canonical not in by_name:
+                unit = item.get("unit") or expected_units[canonical]
+                if unit != expected_units[canonical]:
+                    raise ValueError(f"unsupported quota unit for {canonical}")
+                used = _quota_number(item.get("used"), f"{canonical}.used")
+                limit = _quota_number(item.get("limit"), f"{canonical}.limit")
+                by_name[canonical] = {"resource": canonical, "used": used, "limit": limit,
+                                      "available": max(0, limit - used), "unit": unit}
+        if set(by_name) == {"vCPU", "Memory", "Disk"}:
+            return [by_name[name] for name in ("vCPU", "Memory", "Disk")]
+    raise ValueError("unrecognized quota response structure")
+
+
+def fetch_quota(client: CtyunClient) -> list[dict]:
+    response = client.call("ctecs-global.ctapi.ctyun.cn", "/relay/v1/quota", method="GET")
+    if not isinstance(response, dict):
+        raise ValueError("quota request returned an invalid response")
+    if response.get("statusCode") == 900 or response.get("success") is False:
+        code = response.get("errorCode") or response.get("error") or "unknown"
+        raise ValueError(f"quota request failed: {code}")
+    return normalize_quota(response)
+
+
+def _format_quota_value(value, unit: str) -> str:
+    rendered = f"{value:g}" if isinstance(value, float) else str(value)
+    return f"{rendered} {unit}"
+
+
+def print_quota_text(rows: list[dict]) -> None:
+    print(f'{"RESOURCE":<10}{"USED":<11}{"LIMIT":<11}AVAILABLE')
+    for row in rows:
+        unit = row["unit"]
+        used = _format_quota_value(row["used"], unit)
+        limit = _format_quota_value(row["limit"], unit)
+        available = _format_quota_value(row["available"], unit)
+        print(f'{row["resource"]:<10}{used:<11}{limit:<11}{available}')
+
+
+def print_list_with_quota_json(instances: list[dict], *, quota=None, quota_error=None) -> None:
+    result = {"instances": instances}
+    if quota_error is None:
+        result["quota"] = quota
+    else:
+        result["quotaError"] = quota_error
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+KVM_MANAGED_LABEL = "testing.alauda.io/created-by"
+KVM_MANAGED_VALUE = "ctyun-vm"
+DEFAULT_IDP_KUBECONFIG = Path.home() / ".kube/configs/idp.yaml"
+
+
+def list_kvm_machines(kubeconfig: Path, namespace: str = "idp") -> list[dict]:
+    """Machines created by `ctyun-vm plain --provider kvm` (matched by label, never other IDP machines)."""
+    if not kubeconfig.is_file() or not shutil.which("kubectl"):
+        return []  # no IDP access configured: behave exactly like a ctyun-only client
+    r = _kubectl(kubeconfig, "-n", namespace, "get", "machines.env.alauda.io",
+                 "-l", f"{KVM_MANAGED_LABEL}={KVM_MANAGED_VALUE}", "-o", "json")
+    if r.returncode != 0:
+        log(f"WARNING: cannot list IDP machines: {(r.stderr or '').strip()[:200]}")
+        return []
+    out = []
+    for item in json.loads(r.stdout).get("items", []):
+        st = item.get("status") or {}
+        ip = next((a.get("address") for a in st.get("addresses") or []
+                   if a.get("type") == "internal" and not a.get("ipv6")), None)
+        out.append({
+            "vmName": (item["metadata"].get("labels") or {}).get("testing.alauda.io/name", item["metadata"]["name"]),
+            "instanceID": item["metadata"]["name"], "ip": ip or "-", "status": st.get("phase") or "pending",
+            "provider": "kvm", "idpNamespace": namespace, "idpKubeconfig": str(kubeconfig),
+            "os": (item.get("spec") or {}).get("os"),
+        })
+    return out
+
+
+def merge_kvm(records: list[dict], kvm: list[dict]) -> list[dict]:
+    """Annotate local kvm records with the live Machine phase and add Machines that have no local state."""
+    by_id = {m["instanceID"]: m for m in kvm}
+    seen = set()
+    out = []
+    for r in records:
+        if r.get("provider") == "kvm":
+            m = by_id.get(r["instanceID"])
+            if m is None:  # created before the managed label existed: look the Machine up directly
+                g = _kubectl(Path(r.get("idpKubeconfig") or DEFAULT_IDP_KUBECONFIG), "-n",
+                             r.get("idpNamespace", "idp"), "get", "machine", r["instanceID"],
+                             "-o", "jsonpath={.status.phase}")
+                if g.returncode == 0:
+                    m = {"status": g.stdout.strip() or "pending"}
+                elif "NotFound" in (g.stderr or ""):
+                    m = None
+                else:  # idp unreachable / not authorised: never report as gone, prune must not touch it
+                    m = {"status": "unknown"}
+            r = {**r, "status": m["status"] if m else "not-found"}
+            seen.add(r["instanceID"])
+        out.append(r)
+    out.extend(m for m in kvm if m["instanceID"] not in seen)
+    return out
+
+
+def _confirm(prompt: str, assume_yes: bool) -> None:
+    if assume_yes:
+        return
+    if input(f"{prompt} Type yes to continue: ").strip() != "yes":
+        raise SystemExit("Cancelled.")
+
+
+def archive_local_state(export_root: Path, record: dict) -> Path:
+    source_path = Path(record["localDir"])
+    if source_path.is_symlink():
+        raise ValueError("unsafe local VM state directory")
+    source = source_path.resolve()
+    if source.parent != export_root.resolve():
+        raise ValueError("unsafe local VM state directory")
+    deleted = secure_dir(export_root.resolve() / ".deleted")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    destination = (deleted / f"{source.name}-{stamp}").resolve()
+    if destination.parent != deleted.resolve():
+        raise ValueError("unsafe archive destination")
+    source.rename(destination)
+    destination.chmod(0o700)
+    return destination
+
+
+def delete_vm(client: CtyunClient, export_root: Path, target: str, region_id: str,
+              project_id: str, *, assume_yes: bool = False, timeout_sec: int = 600) -> Path:
+    record = find_local_record(export_root, target)
+    described = client.call(
+        "ctecs-global.ctapi.ctyun.cn", "/v4/ecs/describe-instances", method="POST",
+        body={"regionID": region_id, "projectID": project_id,
+              "instanceIDList": record["instanceID"], "pageNo": 1, "pageSize": 10},
+    )
+    details = ((described.get("returnObj") or {}).get("results") or []) if described.get("statusCode") == 800 else []
+    if not details:
+        print_records([record])
+        _confirm("Instance not found in cloud (already released?). Archive local state only?", assume_yes)
+        source_path = Path(record["localDir"])
+        if source_path.is_symlink():
+            raise ValueError("unsafe local VM state directory")
+        source = source_path.resolve()
+        if source.parent != export_root.resolve():
+            raise ValueError("unsafe local VM state directory")
+        deleted = secure_dir(export_root.resolve() / ".deleted")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        destination = (deleted / f"{source.name}-{stamp}").resolve()
+        if destination.parent != deleted.resolve():
+            raise ValueError("unsafe archive destination")
+        source.rename(destination)
+        destination.chmod(0o700)
+        return destination
+    print_records([{**record, "status": _value(details[0], "status", "instanceStatus")}])
+    _confirm("Release this cloud VM?", assume_yes)
+    response = client.call("ctecs-global.ctapi.ctyun.cn",
+                           f"/relay/v1/instances/{record['instanceID']}/release",
+                           method="POST", body={})
+    if not isinstance(response, dict) or response.get("statusCode") == 900 or response.get("success") is False:
+        raise RuntimeError("release request failed")
+    deadline = time.monotonic() + timeout_sec
+    missing_count = 0
+    poll = 0
+    log(f"waiting for cloud instance to be released (timeout={timeout_sec}s)")
+    while time.monotonic() < deadline:
+        poll += 1
+        elapsed = int(time.monotonic() - (deadline - timeout_sec))
+        current = list_controlled_instances(client, region_id, project_id)
+        still_present = any(x.get("instanceID") == record["instanceID"] for x in current)
+        if not still_present:
+            missing_count += 1
+            log(f"instance gone from list (poll={poll}, elapsed={elapsed}s); confirming via describe-instances")
+            if missing_count >= 2:
+                described = client.call(
+                    "ctecs-global.ctapi.ctyun.cn", "/v4/ecs/describe-instances", method="POST",
+                    body={"regionID": region_id, "projectID": project_id,
+                          "instanceIDList": record["instanceID"], "pageNo": 1, "pageSize": 10},
+                )
+                if described.get("statusCode") == 800 and ((described.get("returnObj") or {}).get("results") or []):
+                    log(f"describe-instances still shows instance; continuing to wait (poll={poll})")
+                    missing_count = 0
+                    time.sleep(5)
+                    continue
+                log("instance confirmed deleted; archiving local state")
+                source_path = Path(record["localDir"])
+                if source_path.is_symlink():
+                    raise ValueError("unsafe local VM state directory")
+                source = source_path.resolve()
+                if source.parent != export_root.resolve():
+                    raise ValueError("unsafe local VM state directory")
+                deleted = secure_dir(export_root.resolve() / ".deleted")
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+                destination = (deleted / f"{source.name}-{stamp}").resolve()
+                if destination.parent != deleted.resolve():
+                    raise ValueError("unsafe archive destination")
+                source.rename(destination)
+                destination.chmod(0o700)
+                return destination
+        else:
+            status = next((x.get("instanceStatus") or x.get("status") for x in current
+                           if x.get("instanceID") == record["instanceID"]), "unknown")
+            log(f"instance still present; status={status} poll={poll} elapsed={elapsed}s")
+            missing_count = 0
+        time.sleep(5)
+    raise TimeoutError("release was not confirmed before timeout; local data was not archived")
+
+
+def archive_root(export_root: Path, *, create: bool = False) -> Path:
+    path = export_root.resolve() / ".deleted"
+    if path.is_symlink():
+        raise ValueError(".deleted must not be a symlink")
+    if create:
+        secure_dir(path)
+    return path
+
+
+def archive_records(export_root: Path) -> list[dict]:
+    deleted = archive_root(export_root)
+    if not deleted.is_dir():
+        return []
+    result = []
+    for item in sorted(deleted.iterdir()):
+        if item.is_symlink() or not item.is_dir():
+            continue
+        record = {"archiveName": item.name, "localDir": str(item)}
+        try:
+            value = json.loads((item / "instance.json").read_text(encoding="utf-8"))
+            if isinstance(value, dict): record.update(value)
+        except (OSError, json.JSONDecodeError):
+            pass
+        result.append(record)
+    return result
+
+
+def safe_archive_path(export_root: Path, archive_name: str) -> Path:
+    if not archive_name or Path(archive_name).name != archive_name or archive_name in {".", ".."}:
+        raise ValueError("invalid archive name")
+    deleted = archive_root(export_root).resolve()
+    candidate = (deleted / archive_name).resolve()
+    if candidate.parent != deleted or candidate == deleted:
+        raise ValueError("archive path escapes .deleted")
+    return candidate
+
+
+def delete_archive(export_root: Path, archive_name: str, assume_yes: bool = False) -> None:
+    path = safe_archive_path(export_root, archive_name)
+    if not path.is_dir():
+        raise ValueError(f"archive not found: {archive_name}")
+    _confirm(f"Permanently delete archive {archive_name}? This cannot be recovered.", assume_yes)
+    shutil.rmtree(path)
+    print(f"Permanently deleted archive: {archive_name} (cannot be recovered)")
+
+
+def purge_archives(export_root: Path, assume_yes: bool = False) -> None:
+    deleted = archive_root(export_root, create=True).resolve()
+    _confirm("Permanently delete ALL archives? This cannot be recovered.", assume_yes)
+    for child in list(deleted.iterdir()):
+        candidate = child.resolve()
+        if candidate.parent != deleted:
+            raise ValueError(f"unsafe archive entry: {child.name}")
+        if candidate.is_dir(): shutil.rmtree(candidate)
+        else: candidate.unlink()
+    print("Permanently deleted all archives (cannot be recovered).")
+
+
+def add_common_options(parser):
+    parser.add_argument("--config", dest="config_file", type=Path,
+                        default=Path.home() / "script/ctyun-vm-config.yaml",
+                        help="YAML config (default: ~/script/ctyun-vm-config.yaml)")
+    parser.add_argument("--export-root", type=Path, default=Path.home() / ".ctyun-vm",
+                        help="state root (default: ~/.ctyun-vm)")
+    parser.add_argument("--ak", "--access-key", dest="access_key",
+                        help="CTYun access key (overrides config)")
+    parser.add_argument("--sk", "--secret-key", dest="secret_key",
+                        help="CTYun secret key (overrides config)")
+
+
+def add_override_options(parser):
+    parser.add_argument("--config", dest="config_file", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--export-root", type=Path, default=argparse.SUPPRESS)
+    parser.add_argument("--ak", "--access-key", dest="access_key", default=argparse.SUPPRESS,
+                        help="CTYun access key (overrides config)")
+    parser.add_argument("--sk", "--secret-key", dest="secret_key", default=argparse.SUPPRESS,
+                        help="CTYun secret key (overrides config)")
+
+
+def valid_name(value: str) -> str:
+    if Path(value).name != value or value.startswith(".") or value in {"", ".", ".."} or "/" in value or "\\" in value:
+        raise argparse.ArgumentTypeError("name must be a single path-safe component")
+    return value
+
+
+def validate_vm_dir(export_root: Path, vm_name: str) -> Path:
+    root = export_root.resolve()
+    path = root / valid_name(vm_name)
+    if path.is_symlink() or path.resolve().parent != root:
+        raise ValueError("unsafe VM state directory")
+    return path
+
+
+def find_archive_record(records: list[dict], target: str) -> dict:
+    matches = [r for r in records if r.get("archiveName") == target or r.get("vmName") == target]
+    if len(matches) != 1:
+        raise ValueError(f"archive not found: {target}" if not matches else f"ambiguous archive: {target}")
+    return matches[0]
+
+
+def parse_args(argv=None):
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    ssh_without_target = False
+    try:
+        ssh_index = raw_argv.index("ssh")
+        ssh_without_target = raw_argv[ssh_index + 1:ssh_index + 2] == ["--"]
+    except ValueError:
+        pass
+    parser = argparse.ArgumentParser(description="Create, inspect, and delete managed CTYun development VMs.")
+    add_common_options(parser)
+    commands = parser.add_subparsers(dest="command", required=True)
+    create = commands.add_parser("create", help="create a VM")
+    add_override_options(create)
+    create.add_argument("vm_name", nargs="?", type=valid_name, help="default: connectors-int-vm-<random>")
+    plain = commands.add_parser("plain", help="create a bare VM (no k3s/tools), e.g. to add as a cluster node")
+    add_override_options(plain)
+    plain.add_argument("vm_name", nargs="?", type=valid_name, default=argparse.SUPPRESS,
+                       help="default: plain-vm-<random>")
+    plain.add_argument("--provider", choices=["ctyun", "kvm"], default="ctyun",
+                       help="ctyun: CTYun ECS via relay (default); kvm: IDP Machine (alauda-idp-kvm, IDC)")
+    plain.add_argument("--os", default=None,
+                       help="ctyun: " + "|".join(sorted(PLAIN_IMAGES)) + " (default ubuntu22); "
+                            "kvm: IDP machine OS such as redhat-9.6 (default), ubuntu-22.04.1, kylinv10-sp3-x86")
+    plain.add_argument("--idp-kubeconfig", type=Path, default=DEFAULT_IDP_KUBECONFIG,
+                       help="kvm: kubeconfig of the IDP cluster (default: ~/.kube/configs/idp.yaml)")
+    plain.add_argument("--idp-namespace", default="idp", help="kvm: Machine namespace (default: idp)")
+    plain.add_argument("--subnet", default="acp-release-subnet",
+                       help="kvm: IDP Subnet name, in --idp-namespace (default: acp-release-subnet, the IDC subnet)")
+    plain.add_argument("--cpu", type=int, default=16, help="kvm: vCPUs (default: 16)")
+    plain.add_argument("--memory", type=int, default=32, help="kvm: memory in GB (default: 32)")
+    plain.add_argument("--team", default="devops", help="kvm: idp.alauda.io/team annotation (default: devops)")
+    plain.add_argument("--purpose", default="daily-testing", help="kvm: user.idp.alauda.io/resource-purpose (default: daily-testing)")
+    plain.add_argument("--ttl-hours", type=int, default=96, help="kvm: testing.alauda.io/iaasTtlHours (default: 96)")
+    plain.add_argument("--image-id", help="explicit image ID, overrides --os")
+    plain.add_argument("--image-type", type=int, default=0, choices=[0, 1],
+                       help="with --image-id: 0=private (default), 1=public")
+    plain.add_argument("--flavor", default="s6.4xlarge.2", help="ctyun: default s6.4xlarge.2 (16C/32G)")
+    plain.add_argument("--disk", type=int, default=100, help="boot disk size in GB (default: 100)")
+    plain.add_argument("--disk-type", default="SATA", choices=["SATA", "SAS", "SSD"])
+    prune = commands.add_parser("prune", help="archive local records whose VM no longer exists in the cloud (not-found)")
+    add_override_options(prune)
+    prune.add_argument("-y", "--yes", action="store_true")
+    prune.add_argument("--dry-run", action="store_true", help="only list what would be archived")
+    listing = commands.add_parser("list", help="list locally managed VMs and cloud status")
+    add_override_options(listing)
+    listing.add_argument("--json", action="store_true")
+    listing.add_argument("--quota", action="store_true", help="also show vCPU, memory, and disk quota")
+    quota = commands.add_parser("quota", help="show vCPU, memory, and disk quota")
+    add_override_options(quota)
+    quota.add_argument("--json", action="store_true")
+    remote = commands.add_parser("remote", help="inspect cloud VMs owned by ctyun.owner")
+    add_override_options(remote)
+    remote_commands = remote.add_subparsers(dest="remote_command", required=True)
+    remote_list = remote_commands.add_parser("list", help="list owned cloud VMs")
+    add_override_options(remote_list); remote_list.add_argument("--json", action="store_true")
+    remote_list.add_argument("-w", "--wide", action="store_true", help="show full remote VM details")
+    remote_show = remote_commands.add_parser("show", help="show one owned cloud VM")
+    add_override_options(remote_show); remote_show.add_argument("target"); remote_show.add_argument("--json", action="store_true")
+    remote_delete = remote_commands.add_parser("delete", help="release an owned cloud VM without local state")
+    add_override_options(remote_delete); remote_delete.add_argument("target"); remote_delete.add_argument("-y", "--yes", action="store_true")
+    show = commands.add_parser("show", help="show one VM")
+    add_override_options(show)
+    show.add_argument("target"); show.add_argument("--json", action="store_true")
+    delete = commands.add_parser("delete", help="release a VM and archive local state")
+    add_override_options(delete)
+    delete.add_argument("targets", nargs="+", help="VM names or instance IDs"); delete.add_argument("-y", "--yes", action="store_true")
+    ssh = commands.add_parser("ssh", help="log in to a locally managed VM or run a remote command")
+    add_override_options(ssh)
+    ssh.add_argument("target", nargs="?", help="VM name or instance ID; optional when exactly one VM exists")
+    ssh.add_argument("remote_argv", nargs=argparse.REMAINDER,
+                     help="remote command and arguments after --")
+    kubeconfig = commands.add_parser("kubeconfig", help="write a VM kubeconfig to ~/.kube/configs")
+    add_override_options(kubeconfig)
+    kubeconfig.add_argument("target", nargs="?", help="VM name or instance ID; optional when exactly one VM exists")
+    kubeconfig.add_argument("--force", action="store_true", help="overwrite an existing kubeconfig")
+    registry = commands.add_parser("registry", help="manage container runtime registry credentials")
+    add_override_options(registry)
+    registry_commands = registry.add_subparsers(dest="registry_command", required=True)
+    rconfigure = registry_commands.add_parser("configure", help="configure credentials from registry.defaults")
+    add_override_options(rconfigure); rconfigure.add_argument("target", nargs="?"); rconfigure.add_argument("--server", required=True, type=validate_registry_server)
+    rlist = registry_commands.add_parser("list", help="list configured registry hosts without credentials")
+    add_override_options(rlist); rlist.add_argument("target", nargs="?"); rlist.add_argument("--json", action="store_true")
+    rremove = registry_commands.add_parser("remove", help="remove one registry hosts.toml")
+    add_override_options(rremove); rremove.add_argument("target", nargs="?"); rremove.add_argument("--server", required=True, type=validate_registry_server); rremove.add_argument("-y", "--yes", action="store_true")
+    archive = commands.add_parser("archive", help="manage deleted VM archives")
+    add_override_options(archive)
+    archive_commands = archive.add_subparsers(dest="archive_command", required=True)
+    alist = archive_commands.add_parser("list"); alist.add_argument("--json", action="store_true")
+    add_override_options(alist)
+    ashow = archive_commands.add_parser("show"); add_override_options(ashow); ashow.add_argument("archive_name"); ashow.add_argument("--json", action="store_true")
+    adelete = archive_commands.add_parser("delete"); add_override_options(adelete); adelete.add_argument("archive_name"); adelete.add_argument("-y", "--yes", action="store_true")
+    apurge = archive_commands.add_parser("purge"); add_override_options(apurge); apurge.add_argument("-y", "--yes", action="store_true")
+    acp = commands.add_parser("acp", help="manage ACP environments")
+    add_override_options(acp)
+    acp_commands = acp.add_subparsers(dest="acp_command", required=True)
+    acp_create = acp_commands.add_parser("create", help="create an ACP environment")
+    add_override_options(acp_create)
+    acp_status = acp_commands.add_parser("status", help="show ACP environments created by this client")
+    add_override_options(acp_status); acp_status.add_argument("target", nargs="?"); acp_status.add_argument("--json", action="store_true")
+    acp_delete = acp_commands.add_parser("delete", help="delete an ACP ReleaseTestPlan")
+    add_override_options(acp_delete); acp_delete.add_argument("target"); acp_delete.add_argument("-y", "--yes", action="store_true")
+    args = parser.parse_args(raw_argv)
+    if args.command == "ssh" and ssh_without_target:
+        args.remote_argv = ([args.target] if args.target is not None else []) + args.remote_argv
+        args.target = None
+    if getattr(args, "vm_name", False) is None:
+        args.vm_name = f"connectors-int-vm-{uuid.uuid4().hex[:8]}"
+    if args.command == "plain" and not hasattr(args, "vm_name"):
+        args.vm_name = f"plain-vm-{uuid.uuid4().hex[:8]}"
+    args.config_file = args.config_file.expanduser().resolve()
+    args.export_root = args.export_root.expanduser().resolve()
+    return args
+
+
+def make_client(cfg: dict, ak_override: str | None = None,
+                sk_override: str | None = None) -> tuple[CtyunClient, str, str]:
+    ak, sk = creds_from_cfg(cfg, ak_override, sk_override)
+    region_id = str(cfg["ctyun"]["regionID"])
+    project_id = str(cfg["instance"].get("projectID", "0"))
+    return CtyunClient(ak, sk, region_id, endpoint_from_cfg(cfg), request_field_overrides_from_cfg(cfg)), region_id, project_id
+
+
+def create_command(args) -> int:
+    vm_name = args.vm_name
+    cfg_path = args.config_file
+    export_root = args.export_root
+    export_dir = validate_vm_dir(export_root, vm_name)
+    secure_dir(export_root)
+    secure_dir(export_dir)
+    log(f"export directory: {export_dir}")
+
+    log(f"loading config: {cfg_path}")
+    cfg = load_cfg(cfg_path)
+    ak, sk = creds_from_cfg(cfg, getattr(args, "access_key", None),
+                            getattr(args, "secret_key", None))
+    endpoint = endpoint_from_cfg(cfg)
+    request_field_overrides = request_field_overrides_from_cfg(cfg)
+    region_id = str(cfg["ctyun"]["regionID"])
+    project_id = str(cfg["instance"].get("projectID", "0"))
+    ssh_user = (cfg.get("cloudInit") or {}).get("sshUser", "root")
+    if endpoint:
+        log(f"using configured CTYun API endpoint: {endpoint}")
+    else:
+        log("using direct CTYun API endpoints")
+    client = CtyunClient(ak, sk, region_id, endpoint, request_field_overrides)
+
+    key_path, pubkey = generate_keypair(export_dir, vm_name)
+    log("resolving latest connectors-int-vm image")
+    image = latest_connectors_image(client, region_id, project_id)
+    log(f"latest image: {image['imageName']} {image['imageID']} {image.get('createdTimeStr', '')}")
+
+    instance_id = create_instance(client, cfg, vm_name, image, pubkey, export_dir)
+    ip = describe_ip(client, region_id, project_id, instance_id)
+    log(f"writing instance metadata under {export_dir}")
+    (export_dir / "ip.txt").write_text(f"{ip}\n")
+    instance_file = export_dir / "instance.json"
+    instance_file.write_text(json.dumps({
+        "vmName": vm_name,
+        "instanceID": instance_id,
+        "ip": ip,
+        "imageID": image["imageID"],
+        "imageName": image.get("imageName"),
+        "toolsEnabled": TOOLS_ENABLED,
+    }, ensure_ascii=False, indent=2))
+    instance_file.chmod(0o600)
+
+    wait_ssh(ip, key_path, ssh_user)
+    kubeconfig = export_dir / "kubeconfig.yaml"
+    export_kubeconfig(ip, key_path, ssh_user, kubeconfig)
+    manifest = export_dir / "manifest.json"
+    export_manifest(ip, key_path, ssh_user, manifest)
+    defaults = registry_defaults_from_cfg(cfg)
+    if defaults:
+        configure_registry_defaults(cfg, export_root, vm_name, ssh_user, wait_ready=lambda *_: None)
+    else:
+        legacy_auth = registry_auth_from_cfg(cfg)
+        if legacy_auth:
+            configure_registry(ip, key_path, ssh_user, legacy_auth)
+    wait_node_internal_ip(ip, kubeconfig)
+    patch_hosts = write_patch_hosts(export_dir, ip)
+
+    print()
+    print("VM started. Tool startup continues in the VM.")
+    print(f"IP: {ip}")
+    print()
+    print("SSH:")
+    print(f"  ssh -i {shlex.quote(str(key_path))} {ssh_user}@{ip}")
+    print()
+    print("export kubeconfig:")
+    print(f"  export KUBECONFIG={shlex.quote(str(kubeconfig))}")
+    print(f"  kubectl --kubeconfig {shlex.quote(str(kubeconfig))} get nodes")
+    print()
+    print("manifest:")
+    print(f"  {manifest}")
+    print()
+    print("patch hosts:")
+    print(f"  {shlex.quote(str(patch_hosts))}")
+    return 0
+
+
+PLAIN_IMAGES = {  # public images in the Guizhou-3 pool (imageType=1)
+    "ubuntu24": "a30fb904-fd9a-4db5-9ee2-ab21f36f39fc",
+    "ubuntu22": "eab616bf-d565-4b76-8e2c-c5534a241ee3",
+    "kylin10": "83715abd-a74c-4645-b705-87d506d0f5c8",
+}
+
+
+def render_plain_userdata(pubkey: str, ssh_user: str) -> str:
+    # MTU 1400 is required for traffic to the IDC networks (see ctyun-relay docs).
+    body = f"""#cloud-config
+disable_root: false
+ssh_pwauth: false
+users:
+  - name: {ssh_user}
+    ssh_authorized_keys:
+      - {pubkey}
+runcmd:
+  - for i in $(ls /sys/class/net | grep -v '^lo$'); do ip link set dev "$i" mtu 1400 || true; done
+"""
+    return base64.b64encode(body.encode()).decode()
+
+
+def _kubectl(kubeconfig: Path, *argv, input_text=None, timeout=60):
+    kubectl = shutil.which("kubectl")
+    if not kubectl:
+        die("kubectl not found in PATH")
+    return run([kubectl, "--kubeconfig", str(kubeconfig), *argv], input_text=input_text, timeout=timeout)
+
+
+def build_kvm_machine(args, cfg: dict, machine_name: str, pubkey: str) -> dict:
+    """An IDP Machine on provider alauda-idp-kvm, shaped like the existing IDC nodes."""
+    owner = str((cfg.get("ctyun") or {}).get("owner") or "")
+    # initData "commands" run at first boot: authorise our generated key for root.
+    commands = [
+        "mkdir -p /root/.ssh && chmod 700 /root/.ssh",
+        f"echo {shlex.quote(pubkey)} >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys",
+    ]
+    annotations = {"idp.alauda.io/team": args.team, "testing.alauda.io/name": args.vm_name}
+    if owner:
+        annotations["idp.alauda.io/creator"] = owner if "@" in owner else f"{owner}@alauda.io"
+    labels = {
+        "env.alauda.io/providerKind": "kvm",
+        "env.alauda.io/providerRef": "alauda-idp-kvm",
+        "testing.alauda.io/iaasTtlHours": str(args.ttl_hours),
+        "testing.alauda.io/name": args.vm_name,
+        "user.idp.alauda.io/resource-purpose": args.purpose,
+        KVM_MANAGED_LABEL: KVM_MANAGED_VALUE,
+    }
+    if owner:
+        labels["idp.alauda.io/creator"] = owner.split("@")[0]
+    return {
+        "apiVersion": "env.alauda.io/v1alpha1",
+        "kind": "Machine",
+        "metadata": {"name": machine_name, "namespace": args.idp_namespace,
+                     "annotations": annotations, "labels": labels},
+        "spec": {
+            "arch": "amd64",
+            "cpu": args.cpu,
+            "memory": args.memory,
+            "os": args.os or "redhat-9.6",
+            "providerRef": "alauda-idp-kvm",
+            "ipProtocol": "ipv4",
+            "multipleNetworkInterfaces": False,
+            "networkInterface": {"name": "eth0",
+                                 "subnetRef": {"name": args.subnet, "namespace": args.idp_namespace}},
+            "rootDiskSize": args.disk,
+            "sshConfig": {"nonRootUsername": "", "port": 22},
+            "initData": [{"type": "commands",
+                          "dataBase64": base64.b64encode(json.dumps(commands).encode()).decode()}],
+        },
+    }
+
+
+def kvm_create_command(args) -> int:
+    vm_name = args.vm_name
+    export_dir = validate_vm_dir(args.export_root, vm_name)
+    secure_dir(args.export_root)
+    secure_dir(export_dir)
+    cfg = load_cfg(args.config_file) if args.config_file.is_file() else {}
+    kubeconfig = args.idp_kubeconfig.expanduser()
+    if not kubeconfig.is_file():
+        die(f"IDP kubeconfig not found: {kubeconfig}")
+    ssh_user = (cfg.get("cloudInit") or {}).get("sshUser", "root")
+    key_path, pubkey = generate_keypair(export_dir, vm_name)
+    state = export_dir / "launch-state.json"
+    if state.exists():
+        machine_name = json.loads(state.read_text()).get("machineName") or uuid.uuid4().hex
+    else:
+        machine_name = uuid.uuid4().hex
+    state.write_text(json.dumps({"vmName": vm_name, "machineName": machine_name, "provider": "kvm"}))
+    state.chmod(0o600)
+    manifest = build_kvm_machine(args, cfg, machine_name, pubkey)
+    log(f"creating IDP Machine {args.idp_namespace}/{machine_name} os={manifest['spec']['os']} "
+        f"cpu={args.cpu} mem={args.memory}G disk={args.disk}G subnet={args.subnet}")
+    r = _kubectl(kubeconfig, "create", "-f", "-", input_text=json.dumps(manifest))
+    if r.returncode != 0 and "AlreadyExists" not in (r.stderr or ""):
+        die(f"create Machine failed: {(r.stderr or r.stdout).strip()}")
+    meta = export_dir / "instance.json"
+    record = {
+        "vmName": vm_name, "instanceID": machine_name, "ip": "-", "provider": "kvm",
+        "idpNamespace": args.idp_namespace, "idpKubeconfig": str(kubeconfig),
+        "os": manifest["spec"]["os"], "plain": True,
+    }
+    # Persist right away so list/delete see the Machine while it is still provisioning.
+    meta.write_text(json.dumps(record, ensure_ascii=False, indent=2))
+    meta.chmod(0o600)
+
+    ip = None
+    for i in range(90):
+        g = _kubectl(kubeconfig, "-n", args.idp_namespace, "get", "machine", machine_name, "-o", "json")
+        if g.returncode == 0:
+            st = (json.loads(g.stdout).get("status") or {})
+            phase = st.get("phase")
+            for a in st.get("addresses") or []:
+                if a.get("type") == "internal" and not a.get("ipv6"):
+                    ip = a.get("address")
+            if phase == "ready" and ip:
+                break
+            if phase in ("failed", "error"):
+                die(f"Machine {machine_name} phase={phase}: {json.dumps(st, ensure_ascii=False)}")
+            note = ""
+            if phase != "ready" and i >= 2:  # surface why provisioning is stuck (e.g. no schedulable host)
+                ev = _kubectl(kubeconfig, "-n", args.idp_namespace, "get", "events",
+                              "--field-selector", f"involvedObject.name={machine_name},type=Warning",
+                              "--sort-by=.lastTimestamp", "-o", "jsonpath={.items[-1:].message}")
+                if ev.returncode == 0 and ev.stdout.strip():
+                    note = f" last warning: {ev.stdout.strip()[:240]}"
+            log(f"waiting for Machine ready; phase={phase or '-'} poll={i + 1}/90{note}")
+        time.sleep(10)
+    if not ip:
+        die(f"Machine {machine_name} not ready within 900s")
+    (export_dir / "ip.txt").write_text(f"{ip}\n")
+    meta.write_text(json.dumps({**record, "ip": ip}, ensure_ascii=False, indent=2))
+    wait_ssh(ip, key_path, ssh_user)
+    print()
+    print("Plain KVM VM started (IDP Machine, no k3s, no tools).")
+    print(f"IP: {ip}")
+    print(f"SSH: ssh -i {shlex.quote(str(key_path))} {ssh_user}@{ip}")
+    print(f"Delete: ctyun-vm delete {vm_name}")
+    return 0
+
+
+def kvm_delete_command(args, record: dict) -> int:
+    kubeconfig = Path(record.get("idpKubeconfig") or args.idp_kubeconfig).expanduser()
+    ns = record.get("idpNamespace", "idp")
+    print_records([record])
+    _confirm(f"Delete IDP Machine {ns}/{record['instanceID']}?", args.yes)
+    r = _kubectl(kubeconfig, "-n", ns, "delete", "machine", record["instanceID"], "--wait=true", timeout=600)
+    if r.returncode != 0 and "NotFound" not in (r.stderr or ""):
+        die(f"delete Machine failed: {(r.stderr or r.stdout).strip()}")
+    if not record.get("localDir"):
+        print("IDP Machine deleted (no local state to archive).")
+        return 0
+    source = Path(record["localDir"]).resolve()
+    if source.parent != args.export_root.resolve():
+        raise ValueError("unsafe local VM state directory")
+    deleted = secure_dir(args.export_root.resolve() / ".deleted")
+    dest = deleted / f"{source.name}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}"
+    source.rename(dest)
+    print(f"IDP Machine deleted; local state archived at: {dest}")
+    return 0
+
+
+def plain_create_command(args) -> int:
+    """Create a bare VM: no connectors-int image, no k3s, no tools, no registry setup."""
+    vm_name = args.vm_name
+    export_root = args.export_root
+    export_dir = validate_vm_dir(export_root, vm_name)
+    secure_dir(export_root)
+    secure_dir(export_dir)
+    cfg = load_cfg(args.config_file)
+    ak, sk = creds_from_cfg(cfg, getattr(args, "access_key", None),
+                            getattr(args, "secret_key", None))
+    ctyun = cfg["ctyun"]
+    network = cfg["network"]
+    instance = cfg.get("instance") or {}
+    region_id = str(ctyun["regionID"])
+    project_id = str(instance.get("projectID", "0"))
+    ssh_user = (cfg.get("cloudInit") or {}).get("sshUser", "root")
+    client = CtyunClient(ak, sk, region_id, endpoint_from_cfg(cfg), request_field_overrides_from_cfg(cfg))
+
+    os_name = args.os or "ubuntu22"
+    if not args.image_id and os_name not in PLAIN_IMAGES:
+        die(f"unknown ctyun --os {os_name!r}; choose one of {sorted(PLAIN_IMAGES)} or pass --image-id")
+    image_id = args.image_id or PLAIN_IMAGES[os_name]
+    image_type = args.image_type if args.image_id else 1
+    key_path, pubkey = generate_keypair(export_dir, vm_name)
+    client_token = load_or_create_client_token(export_dir, vm_name, image_id, network["subnetID"])
+    body = {
+        "clientToken": client_token,
+        "regionID": region_id,
+        "instanceName": vm_name,
+        "displayName": vm_name,
+        "flavorName": args.flavor,
+        "imageType": image_type,
+        "imageID": image_id,
+        "bootDiskType": args.disk_type,
+        "bootDiskSize": args.disk,
+        "onDemand": True,
+        "extIP": str(network.get("extIP", "0")),
+        "secGroupList": [network["securityGroupID"]],
+        "networkCardList": [{"subnetID": network["subnetID"], "isMaster": True}],
+        "userData": render_plain_userdata(pubkey, ssh_user),
+        "projectID": project_id,
+        "vpcID": network["vpcID"],
+    }
+    if ctyun.get("azName"):
+        body["azName"] = ctyun["azName"]
+    log(f"creating plain VM name={vm_name} flavor={args.flavor} imageID={image_id}")
+    r = client.call("ctecs-global.ctapi.ctyun.cn", "/v4/ecs/create-instance", method="POST", body=body)
+    if r.get("statusCode") != 800:
+        die(f"create-instance failed: {json.dumps(r, ensure_ascii=False)}")
+    order_id = (r.get("returnObj") or {}).get("masterOrderID")
+    if not order_id:
+        die(f"create-instance returned no masterOrderID: {json.dumps(r, ensure_ascii=False)}")
+    instance_id = None
+    for i in range(30):
+        q = client.call("ctecs-global.ctapi.ctyun.cn", "/v4/ecs/order/query-uuid",
+                        method="GET", query={"masterOrderID": order_id})
+        ids = (q.get("returnObj") or {}).get("instanceIDList") or []
+        if ids:
+            instance_id = ids[0]
+            break
+        log(f"waiting for instanceID; poll={i + 1}/30")
+        time.sleep(10)
+    if not instance_id:
+        die(f"order {order_id} did not resolve to an instanceID within 300s")
+    meta = export_dir / "instance.json"
+    record = {"vmName": vm_name, "instanceID": instance_id, "ip": "-",
+              "imageID": image_id, "flavorName": args.flavor, "plain": True}
+    # Persist as soon as the instance exists so list/delete see it while it is still booting.
+    meta.write_text(json.dumps(record, ensure_ascii=False, indent=2))
+    meta.chmod(0o600)
+    ip = describe_ip(client, region_id, project_id, instance_id)
+    (export_dir / "ip.txt").write_text(f"{ip}\n")
+    meta.write_text(json.dumps({**record, "ip": ip}, ensure_ascii=False, indent=2))
+    wait_ssh(ip, key_path, ssh_user)
+
+    print()
+    print("Plain VM started (no k3s, no tools).")
+    print(f"IP: {ip}")
+    print(f"SSH: ssh -i {shlex.quote(str(key_path))} {ssh_user}@{ip}")
+    print(f"Delete: ctyun-vm delete {vm_name}")
+    return 0
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    secure_dir(args.export_root)
+    if args.command != "delete":
+        return dispatch(args)
+    # Delete each target in turn and keep going after a failure.
+    failures = 0
+    for target in args.targets:
+        args.target = target
+        try:
+            rc = dispatch(args)
+        except SystemExit as e:
+            rc = e.code if isinstance(e.code, int) else 1
+        except (ValueError, RuntimeError, TimeoutError, OSError) as e:
+            print(f"ERROR: failed to delete {target}: {e}", file=sys.stderr)
+            rc = 1
+        failures += 1 if rc else 0
+    return 1 if failures else 0
+
+
+def dispatch(args) -> int:
+    if args.command == "acp":
+        try:
+            from ctyun_vm_acp.cli import run as run_acp
+            return run_acp(
+                [args.acp_command] + ([args.target] if getattr(args, "target", None) else [])
+                + (["--yes"] if getattr(args, "yes", False) else [])
+                + (["--json"] if getattr(args, "json", False) else []),
+                args.config_file,
+            )
+        except (ValueError, OSError, subprocess.SubprocessError) as e:
+            die(str(e))
+    if args.command == "create":
+        return create_command(args)
+    if args.command == "plain":
+        return kvm_create_command(args) if args.provider == "kvm" else plain_create_command(args)
+    if args.command == "delete":
+        try:
+            rec = find_local_record(args.export_root, args.target)
+        except ValueError:
+            rec = None
+        if rec is None:
+            hits = [m for m in list_kvm_machines(DEFAULT_IDP_KUBECONFIG)
+                    if args.target in (m["vmName"], m["instanceID"])]
+            if len(hits) == 1:
+                rec = {**hits[0], "localDir": ""}
+        if rec and rec.get("provider") == "kvm":
+            args.idp_kubeconfig = DEFAULT_IDP_KUBECONFIG
+            try:
+                return kvm_delete_command(args, rec)
+            except (ValueError, OSError) as e:
+                die(str(e))
+    if args.command == "ssh":
+        cfg = load_cfg(args.config_file) if args.config_file.is_file() else {}
+        ssh_user = str((cfg.get("cloudInit") or {}).get("sshUser", "root"))
+        remote_argv = args.remote_argv
+        if remote_argv[:1] == ["--"]:
+            remote_argv = remote_argv[1:]
+        try:
+            ssh_vm(args.export_root, args.target, ssh_user, remote_argv)
+        except ValueError as e:
+            die(str(e))
+        return 0
+    if args.command == "kubeconfig":
+        cfg = load_cfg(args.config_file) if args.config_file.is_file() else {}
+        ssh_user = str((cfg.get("cloudInit") or {}).get("sshUser", "root"))
+        try:
+            path = install_kubeconfig(args.export_root, args.target, ssh_user, force=args.force)
+        except (ValueError, FileExistsError, OSError, subprocess.SubprocessError) as e:
+            die(str(e))
+        print(path)
+        print(f"export KUBECONFIG={shlex.quote(str(path))}")
+        return 0
+    if args.command == "registry":
+        cfg = load_cfg(args.config_file) if args.config_file.is_file() else {}
+        ssh_user = str((cfg.get("cloudInit") or {}).get("sshUser", "root"))
+        try:
+            if args.registry_command == "configure":
+                registry_configure(args.export_root, args.target, ssh_user,
+                                   registry_entry_from_cfg(cfg, args.server))
+            elif args.registry_command == "list":
+                rows = registry_list(args.export_root, args.target, ssh_user)
+                if args.json: print(json.dumps(rows, ensure_ascii=False, indent=2))
+                else:
+                    print("SERVER\tHOSTS.TOML")
+                    for row in rows: print(f'{row["server"]}\t{str(row["hostsToml"]).lower()}')
+            else:
+                registry_remove(args.export_root, args.target, ssh_user, args.server, args.yes)
+        except (ValueError, OSError, subprocess.SubprocessError) as e:
+            die(str(e))
+        return 0
+    if args.command == "archive":
+        records = archive_records(args.export_root)
+        if args.archive_command == "list":
+            print_records(records, as_json=args.json); return 0
+        if args.archive_command == "show":
+            try: match = find_archive_record(records, args.archive_name)
+            except ValueError as e: die(str(e))
+            print_records([match], as_json=args.json); return 0
+        if args.archive_command == "delete":
+            try: match = find_archive_record(records, args.archive_name)
+            except ValueError as e: die(str(e))
+            delete_archive(args.export_root, match["archiveName"], args.yes); return 0
+        purge_archives(args.export_root, args.yes); return 0
+    cfg = load_cfg(args.config_file)
+    client, region_id, project_id = make_client(
+        cfg, getattr(args, "access_key", None), getattr(args, "secret_key", None)
+    )
+    if args.command == "remote":
+        try:
+            owner = remote_owner_from_cfg(cfg)
+            if args.remote_command == "delete":
+                record = remote_delete_vm(
+                    client, args.export_root, args.target, region_id, project_id, owner,
+                    assume_yes=args.yes,
+                )
+                print(f"Cloud VM released: {record.get('vmName')} ({record.get('instanceID')})")
+                return 0
+            records = list_remote_instances(client, region_id, project_id, owner)
+            if args.remote_command == "show":
+                records = [find_remote_record(records, args.target)]
+        except (ValueError, RuntimeError, TimeoutError) as e:
+            die(str(e))
+        print_remote_records(records, as_json=args.json,
+                             wide=args.remote_command == "show" or getattr(args, "wide", False))
+        return 0
+    if args.command == "quota":
+        try:
+            quota_rows = fetch_quota(client)
+        except ValueError as e:
+            die(str(e))
+        if args.json:
+            print(json.dumps(quota_rows, ensure_ascii=False, indent=2))
+        else:
+            print_quota_text(quota_rows)
+        return 0
+    local = load_local_records(args.export_root)
+    cloud = list_controlled_instances(client, region_id, project_id)
+    by_id = {x.get("instanceID"): x for x in cloud}
+    if args.command == "prune":
+        combined = merge_kvm(merge_local_cloud(local, cloud), list_kvm_machines(DEFAULT_IDP_KUBECONFIG))
+        stale = [r for r in combined if r.get("status") == "not-found" and r.get("localDir")]
+        if not stale:
+            print("Nothing to prune: every local record still exists in the cloud.")
+            return 0
+        print_records(stale)
+        if args.dry_run:
+            print(f"\n{len(stale)} record(s) would be archived (dry run).")
+            return 0
+        _confirm(f"Archive local state of these {len(stale)} record(s) (cloud VM already gone)?", args.yes)
+        for r in stale:
+            print(f"archived {r['vmName']} -> {archive_local_state(args.export_root, r)}")
+        return 0
+    if args.command == "list":
+        combined = merge_kvm(merge_local_cloud(local, cloud), list_kvm_machines(DEFAULT_IDP_KUBECONFIG))
+        if not args.quota:
+            print_records(combined, as_json=args.json); return 0
+        try:
+            quota_rows = fetch_quota(client)
+            quota_error = None
+        except ValueError as e:
+            quota_rows = None
+            quota_error = str(e)
+        if args.json:
+            safe = [{k: r.get(k) for k in ("archiveName", "vmName", "instanceID", "ip", "status", "localDir")
+                     if r.get(k) is not None} for r in combined]
+            print_list_with_quota_json(safe, quota=quota_rows, quota_error=quota_error)
+        else:
+            print_records(combined)
+            print()
+            if quota_error:
+                print(f"WARNING: quota unavailable: {quota_error}", file=sys.stderr)
+            else:
+                print_quota_text(quota_rows)
+        return 0 if quota_error is None else 2
+    if args.command == "show":
+        record = find_local_record(args.export_root, args.target)
+        item = by_id.get(record["instanceID"])
+        if item:
+            response = client.call("ctecs-global.ctapi.ctyun.cn", "/v4/ecs/describe-instances", method="POST",
+                                   body={"regionID": region_id, "projectID": project_id,
+                                         "instanceIDList": record["instanceID"], "pageNo": 1, "pageSize": 10})
+            details = ((response.get("returnObj") or {}).get("results") or [{}])[0]
+            record = {**record, "status": _value(details, "status", "instanceStatus") or _value(item, "status", "instanceStatus")}
+        else: record = {**record, "status": "not-found"}
+        print_records([record], as_json=args.json); return 0
+    destination = delete_vm(client, args.export_root, args.target, region_id, project_id, assume_yes=args.yes)
+    print(f"Cloud VM released; local state archived at: {destination}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
