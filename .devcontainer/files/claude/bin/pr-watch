@@ -2,12 +2,15 @@
 """Watch a GitLab merge request and exit only when something needs attention.
 
 Usage:
-  pr-watch <mr-url> --once          print one status line and exit
-  pr-watch <mr-url> [--interval S] [--timeout S]   block until an event
+  pr-watch <mr-url>... --once          print one status line per MR and exit
+  pr-watch <mr-url>... [--interval S] [--timeout S]   block until any MR has an event
 
 Run the blocking form as a background command: the exit is the single wake-up.
+Pass every MR the session is waiting on to one process instead of one watcher
+per MR. An MR that is merged or closed with nothing new is dropped and the
+others keep being watched. Default timeout is 24h.
 Exit codes: 0 event reported, 2 timed out with nothing new, 3 API unreachable or
-MR not found, 4 MR already merged or closed (don't re-arm).
+MR not found, 4 every MR already merged or closed (don't re-arm).
 Reported events are remembered per MR, so re-arming does not repeat them. Comments
 containing NOTE_MARKER are the agent's own and do not count as new.
 """
@@ -181,67 +184,127 @@ def save_state(path, seen, last_note):
         print(f"warning: could not save state: {err}", file=sys.stderr)
 
 
-def watch(host, group, iid, interval, timeout, sleep=time.sleep, clock=time.time):
-    state_path = os.path.join(STATE_DIR, re.sub(r"\W+", "_", f"{host}_{group}_{iid}") + ".json")
-    state = load_state(state_path)
-    seen = set(state.get("seen", []))
-    last_note = state.get("last_note")
+class Target:
+    """One watched MR and the events already reported for it."""
+
+    def __init__(self, host, group, iid):
+        self.host, self.group, self.iid = host, group, iid
+        self.ref = f"{group}!{iid}"
+        self.path = os.path.join(STATE_DIR, re.sub(r"\W+", "_", f"{host}_{group}_{iid}") + ".json")
+        state = load_state(self.path)
+        self.seen = set(state.get("seen", []))
+        self.last_note = state.get("last_note")
+        self.snap = None
+
+    def save(self):
+        save_state(self.path, self.seen, self.last_note)
+
+    def check(self):
+        """Return the new event names; an empty list means nothing new."""
+        snap = self.snap = snapshot(self.host, self.group, self.iid)
+        if self.last_note is None:
+            self.last_note = max(snap["note_ids"], default=0)
+        if snap["state"] == "opened":
+            self.seen = {s for s in self.seen if not s.startswith("state:")}
+        new = sorted(signatures(snap) - self.seen)
+        fresh_notes = [n for n in snap["note_ids"] if n > self.last_note]
+        if not (new or fresh_notes):
+            return []
+        self.seen |= set(new)
+        self.last_note = max(snap["note_ids"], default=self.last_note)
+        self.save()
+        return new + ([f"new-comments:{len(fresh_notes)}"] if fresh_notes else [])
+
+
+def watch_many(targets, interval, timeout, sleep=time.sleep, clock=time.time):
+    """Block until any target has an event, so several MRs cost one wake-up."""
+    multi = len(targets) > 1
+    tag = (lambda t: f"[{t.ref}] ") if multi else (lambda t: "")
     deadline = clock() + timeout
     failures = 0
-    snap = None
     while clock() < deadline:
-        try:
-            snap = snapshot(host, group, iid)
-            failures = 0
-        except NotFound as err:
-            print(f"MR not found: {err}")
+        events, done, error, missing, ok = [], [], None, None, 0
+        for target in targets:
+            try:
+                found = target.check()
+            except NotFound as err:
+                missing = err
+                continue
+            except API_ERRORS as err:
+                # Keep checking the others: an event found this round is already saved
+                # as reported, so it must be printed rather than dropped.
+                error = err
+                continue
+            ok += 1
+            if found:
+                events.append((target, found))
+            elif target.snap["state"] != "opened":
+                done.append(target)
+        if missing and not events:
+            print(f"MR not found: {missing}")
             return 3
-        except API_ERRORS as err:
+        if missing:
+            print(f"MR not found (re-arm without it): {missing}")
+        if error and not ok:
             failures += 1
             if failures >= MAX_API_FAILURES:
-                print(f"API unreachable after {failures} attempts: {err}")
+                print(f"API unreachable after {failures} attempts: {error}")
                 return 3
             sleep(interval)
             continue
-        if last_note is None:
-            last_note = max(snap["note_ids"], default=0)
-        if snap["state"] == "opened":
-            seen = {s for s in seen if not s.startswith("state:")}
-        new = sorted(signatures(snap) - seen)
-        fresh_notes = [n for n in snap["note_ids"] if n > last_note]
-        if new or fresh_notes:
-            seen |= set(new)
-            last_note = max(snap["note_ids"], default=last_note)
-            save_state(state_path, seen, last_note)
-            print("EVENT " + " ".join(new + ([f"new-comments:{len(fresh_notes)}"] if fresh_notes else [])))
-            print_snapshot(snap)
+        failures = 0
+        if events:
+            for target, found in events:
+                print(f"EVENT {tag(target)}" + " ".join(found))
+                print_snapshot(target.snap)
+            reported = {t for t, _ in events}
+            for target in targets:
+                if target not in reported and target.snap:
+                    print(f"  quiet {tag(target)}{line(target.snap)}")
             return 0
-        if snap["state"] != "opened":
-            save_state(state_path, seen, last_note)
-            print("DONE " + line(snap))
+        if len(done) == len(targets):
+            for target in done:
+                target.save()
+                print(f"DONE {tag(target)}{line(target.snap)}")
             return 4
+        if done:
+            # Merged or closed with nothing new: stop polling it, keep the rest.
+            for target in done:
+                target.save()
+                print(f"DONE {tag(target)}{line(target.snap)}", flush=True)
+            targets = [t for t in targets if t not in done]
         sleep(interval)
-    save_state(state_path, seen, last_note)
-    print("TIMEOUT nothing new; " + (line(snap) if snap else "no successful API call"))
+    for target in targets:
+        target.save()
+        print(f"TIMEOUT nothing new; {tag(target)}" + (line(target.snap) if target.snap else "no successful API call"))
     return 2
+
+
+def watch(host, group, iid, interval, timeout, sleep=time.sleep, clock=time.time):
+    return watch_many([Target(host, group, iid)], interval, timeout, sleep, clock)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("url")
+    parser.add_argument("urls", nargs="+", metavar="url")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--interval", type=int, default=120)
-    parser.add_argument("--timeout", type=int, default=6 * 3600)
+    parser.add_argument("--timeout", type=int, default=24 * 3600)
     args = parser.parse_args()
-    host, group, iid = parse_url(args.url)
+    targets = [Target(*parse_url(url)) for url in args.urls]
     if not args.once:
-        return watch(host, group, iid, args.interval, args.timeout)
-    try:
-        print_snapshot(snapshot(host, group, iid))
-    except (NotFound, *API_ERRORS) as err:
-        print(f"API unreachable or MR not found: {err}")
-        return 3
-    return 0
+        return watch_many(targets, args.interval, args.timeout)
+    code = 0
+    for target in targets:
+        try:
+            snap = snapshot(target.host, target.group, target.iid)
+            if len(targets) > 1:
+                print(f"[{target.ref}]", end=" ")
+            print_snapshot(snap)
+        except (NotFound, *API_ERRORS) as err:
+            print(f"[{target.ref}] API unreachable or MR not found: {err}")
+            code = 3
+    return code
 
 
 if __name__ == "__main__":

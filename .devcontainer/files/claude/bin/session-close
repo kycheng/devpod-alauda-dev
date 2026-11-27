@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""Close a finished Discord-bound session and clean up after it, in one command.
+
+Usage:
+  session-close <key>                 dry run: show what would be closed and any open close-out items
+  session-close <key> --yes           do it; refuses while close-out items are open
+  session-close <key> --yes --force   do it anyway (only when the user said so)
+  session-close <key> --keep-worktree leave the worktree in place
+
+<key> is a Jira number (44913), a sid prefix, or any fragment of the session's cwd.
+
+Checks before closing:
+  - the worktree has no uncommitted changes and no commits missing from the remote;
+  - the Jira ticket named in the cwd is in a done-like status, has an Output URL and a comment.
+Then it kills the zellij session, removes the bindings.json row (after a backup), removes the
+worktree with `git worktree remove` (never --force) and deletes the session's temp files:
+the devpod scratchpad directories for that cwd, plus every path listed under a
+`## Temp files` heading of the ticket's handoff file (`- /tmp/x`, `- mac:/tmp/y`), limited to
+the prefixes in SAFE_PREFIXES. Finally the handoff file moves to handoff/done/.
+"""
+import argparse
+import datetime
+import glob
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+BINDINGS = os.environ.get("BINDINGS_JSON", "/workspaces/.claude/channels/discord/bindings.json")
+HANDOFF = "/workspaces/.claude/handoff"
+SCRATCH_ROOT = "/tmp/claude-1000"
+ENV_FILE = os.path.expanduser("~/.env.alauda")
+JIRA = "https://jira.alauda.cn"
+DONE_STATUSES = {"done", "closed", "resolved", "已完成", "完成", "已关闭", "已解决", "测试通过", "待发布", "released"}
+SAFE_PREFIXES = {
+    "devpod": ("/tmp/", SCRATCH_ROOT + "/"),
+    "mac": ("/tmp/", "/private/tmp/", "/Users/mac/tmp/", "/Users/mac/claude-work/"),
+}
+ZELLIJ_ENV = {k: v for k, v in os.environ.items() if k not in ("ZELLIJ", "ZELLIJ_SESSION_NAME")}
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=kw.pop("timeout", 60), **kw)
+
+
+def load_bindings():
+    try:
+        with open(BINDINGS) as f:
+            return json.load(f)
+    except (OSError, ValueError) as err:
+        sys.exit(f"cannot read {BINDINGS}: {err}")
+
+
+def find_binding(key):
+    rows = load_bindings()
+    hits = {sid: row for sid, row in rows.items() if sid.startswith(key) or key in row.get("cwd", "")}
+    return rows, hits
+
+
+def zellij_session(sid):
+    out = run(["zellij", "list-sessions", "--no-formatting"], env=ZELLIJ_ENV).stdout
+    for line in out.splitlines():
+        name = line.split(" ", 1)[0]
+        if name.endswith("-" + sid):
+            return name
+    return None
+
+
+def git_problems(cwd):
+    if not os.path.isdir(cwd) or not os.path.exists(os.path.join(cwd, ".git")):
+        return []
+    problems = []
+    dirty = run(["git", "-C", cwd, "status", "--porcelain"]).stdout.strip()
+    if dirty:
+        problems.append(f"worktree has uncommitted changes:\n{dirty[:600]}")
+    unpushed = run(["git", "-C", cwd, "log", "--oneline", "HEAD", "--not", "--remotes"]).stdout.strip()
+    if unpushed:
+        problems.append(f"commits not on any remote:\n{unpushed[:600]}")
+    return problems
+
+
+def jira_env():
+    env = {}
+    try:
+        for line in open(ENV_FILE):
+            m = re.match(r"\s*(?:export\s+)?(JIRA_USERNAME|JIRA_PASSWORD)=(?:'([^']*)'|\"([^\"]*)\"|(\S*))", line)
+            if m:
+                env[m.group(1)] = next(g for g in m.groups()[1:] if g is not None)
+    except OSError:
+        pass
+    return env
+
+
+def jira_problems(ticket):
+    env = jira_env()
+    if not env.get("JIRA_USERNAME"):
+        return [f"{ticket}: no Jira credentials in {ENV_FILE}, close-out not checked"]
+    # Credentials go through stdin so they stay out of the process list.
+    cred = f'{env["JIRA_USERNAME"]}:{env.get("JIRA_PASSWORD", "")}'.replace("\\", "\\\\").replace('"', '\\"')
+    config = f'user = "{cred}"\n'
+    url = f"{JIRA}/rest/api/2/issue/{ticket}?fields=status,customfield_12406,comment"
+    out = run(["curl", "-sS", "--max-time", "30", "-w", "\n%{http_code}", "-K", "-", url], input=config, timeout=40)
+    body, _, code = out.stdout.rpartition("\n")
+    if code == "404":
+        print(f"jira      {ticket}: no such issue, close-out not checked")
+        return []
+    try:
+        if out.returncode or code != "200":
+            raise ValueError(f"HTTP {code} {out.stderr.strip()[-120:]}")
+        fields = json.loads(body)["fields"]
+    except (ValueError, KeyError, TypeError) as err:
+        return [f"{ticket}: Jira not readable ({err}), close-out not checked"]
+    status = fields["status"]["name"]
+    urls = [u for u in (fields.get("customfield_12406") or "").splitlines() if u.strip()]
+    comments = fields.get("comment", {}).get("comments", [])
+    last = comments[-1]["created"][:10] if comments else "none"
+    print(f"jira      {ticket}: status={status}, output-urls={len(urls)}, last-comment={last}")
+    problems = []
+    if status.lower() not in DONE_STATUSES:
+        problems.append(f"{ticket} is still '{status}'")
+    if not urls:
+        problems.append(f"{ticket} has no Output URL")
+    if not comments:
+        problems.append(f"{ticket} has no comment with the change summary and test results")
+    return problems
+
+
+def temp_paths(ticket, cwd):
+    paths = [("devpod", d) for d in glob.glob(f"{SCRATCH_ROOT}/{re.sub(r'[^A-Za-z0-9]', '-', cwd)}")]
+    n_scratch = len(paths)
+    handoff = os.path.join(HANDOFF, f"{ticket}.md") if ticket else None
+    if handoff and os.path.exists(handoff):
+        section = False
+        for line in open(handoff):
+            if line.startswith("#"):
+                section = line.strip().lower().lstrip("#").strip() == "temp files"
+                continue
+            m = re.match(r"\s*[-*]\s+`?(mac:)?(/[^\s`]+)", line) if section else None
+            if m:
+                paths.append(("mac" if m.group(1) else "devpod", m.group(2)))
+    safe, skipped = [], []
+    for i, (where, path) in enumerate(paths):
+        from_handoff = i >= n_scratch
+        norm = os.path.normpath(path)
+        if where == "devpod":
+            norm = os.path.realpath(norm)
+        roots = {p.rstrip("/") for p in SAFE_PREFIXES[where]}
+        ok = (not re.search(r"[*?\[\]{}$`;|&<>'\"\\]", norm)
+              and norm.startswith(SAFE_PREFIXES[where]) and norm not in roots)
+        if ok and where == "devpod" and from_handoff:
+            # The cwd's scratchpad is handled above; other sessions' live under SCRATCH_ROOT.
+            ok = not (norm == SCRATCH_ROOT or norm.startswith(SCRATCH_ROOT + "/"))
+        (safe if ok else skipped).append((where, norm))
+    return safe, skipped
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("key")
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--keep-worktree", action="store_true")
+    args = parser.parse_args()
+
+    rows, hits = find_binding(args.key)
+    if len(hits) != 1:
+        print(f"{len(hits)} bindings match '{args.key}':")
+        for sid, row in hits.items():
+            print(f"  {sid}  {row.get('cwd')}")
+        return 1
+    sid, row = next(iter(hits.items()))
+    cwd = row.get("cwd", "")
+    match = re.search(r"\b([A-Za-z]{2,}[A-Za-z0-9]*-\d{3,})", cwd)
+    ticket = match.group(1).upper() if match else None
+    session = zellij_session(sid)
+    in_worktree = cwd.startswith("/workspaces/.worktrees/")
+    print(f"session   {session or '(not running)'}")
+    print(f"binding   {sid}  thread={row.get('thread_id')}")
+    print(f"cwd       {cwd}" + ("" if in_worktree else "  (not a worktree, left in place)"))
+
+    problems = git_problems(cwd) if in_worktree and not args.keep_worktree else []
+    if ticket:
+        problems += jira_problems(ticket)
+    safe, skipped = temp_paths(ticket, cwd)
+    for where, path in safe:
+        print(f"temp      {where}:{path}")
+    for where, path in skipped:
+        print(f"skip      {where}:{path} (outside the allowed prefixes, delete by hand if wanted)")
+    for p in problems:
+        print(f"OPEN      {p}")
+
+    if not args.yes:
+        print("dry run; rerun with --yes to close" + (" (close-out items above are open)" if problems else ""))
+        return 0
+    if problems and not args.force:
+        print("refusing: finish the open close-out items first, or pass --force if the user said to skip them")
+        return 2
+
+    if in_worktree and not args.keep_worktree and os.path.isdir(cwd):
+        main_repo = run(["git", "-C", cwd, "worktree", "list", "--porcelain"]).stdout.split("\n", 1)[0][9:]
+        out = run(["git", "-C", main_repo, "worktree", "remove", cwd])
+        if out.returncode:
+            print(f"worktree  NOT removed, stopping before anything else changes: {out.stderr.strip()}")
+            return 2
+        print(f"worktree  removed {cwd}")
+    for where, path in safe:
+        if where == "devpod":
+            shutil.rmtree(path, ignore_errors=True) if os.path.isdir(path) else (os.path.exists(path) and os.remove(path))
+    mac = [p for w, p in safe if w == "mac"]
+    if mac:
+        out = run(["ssh", "-o", "ConnectTimeout=8", "mac", "rm -rf -- " + " ".join(shlex.quote(p) for p in mac)])
+        print("mac temp  removed" if out.returncode == 0 else f"mac temp  NOT removed: {out.stderr.strip()[-200:]}")
+    handoff = os.path.join(HANDOFF, f"{ticket}.md") if ticket else None
+    if handoff and os.path.exists(handoff):
+        os.makedirs(os.path.join(HANDOFF, "done"), exist_ok=True)
+        os.replace(handoff, os.path.join(HANDOFF, "done", f"{ticket}.md"))
+        print(f"handoff   archived to {HANDOFF}/done/{ticket}.md")
+    # Re-read so a binding added meanwhile by another launch is kept.
+    rows = load_bindings()
+    if sid in rows:
+        backup = f"{BINDINGS}.bak-{datetime.datetime.now():%Y%m%d%H%M%S}"
+        shutil.copy2(BINDINGS, backup)
+        del rows[sid]
+        tmp = f"{BINDINGS}.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump(rows, f, indent=2)
+        os.replace(tmp, BINDINGS)
+        print(f"unbound   {sid} (backup {backup}); thread {row.get('thread_id')} is orphaned, archive it in Discord")
+    if session:
+        # Last, because the caller may be the agent inside this very session.
+        if os.environ.get("ZELLIJ_SESSION_NAME") == session:
+            kill = f"sleep 3; zellij kill-session {shlex.quote(session)}; zellij delete-session {shlex.quote(session)} --force"
+            subprocess.Popen(["setsid", "sh", "-c", kill], env=ZELLIJ_ENV, stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            print(f"killing   {session} in 3s (this session); nothing after this line will be reported")
+        else:
+            out = run(["zellij", "kill-session", session], env=ZELLIJ_ENV)
+            run(["zellij", "delete-session", session, "--force"], env=ZELLIJ_ENV)
+            print(f"killed    {session}" if out.returncode == 0 else f"kill      FAILED for {session}: {out.stderr.strip()}")
+    print("done")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

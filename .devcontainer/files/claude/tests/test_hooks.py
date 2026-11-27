@@ -199,10 +199,97 @@ class PrWatch(unittest.TestCase):
     def test_not_found_fails_fast(self):
         self.assertEqual(self.run_watch([self.watcher.NotFound("x")]), 3)
 
+    def run_many(self, per_mr, timeout=1):
+        """per_mr maps iid to its snapshots in poll order; a round ends the run once any queue is empty."""
+        now = [0]
+        queues = {k: list(v) for k, v in per_mr.items()}
+
+        def fake_snapshot(_host, _group, iid):
+            queue = queues[iid]
+            if not queue:
+                now[0] = timeout + 1
+                raise OSError("no more")
+            item = queue.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        targets = [self.watcher.Target("h", "g", iid) for iid in per_mr]
+        with mock.patch.object(self.watcher, "snapshot", fake_snapshot), \
+                mock.patch("sys.stdout") as out:
+            code = self.watcher.watch_many(targets, 0, timeout, sleep=lambda _: None, clock=lambda: now[0])
+        return code, "".join(c.args[0] for c in out.write.call_args_list if c.args)
+
+    def test_many_wakes_on_any_event_and_names_it(self):
+        quiet = snap(self.watcher)
+        code, text = self.run_many({"1": [quiet], "2": [snap(self.watcher, statuses=[status(1, "t", "failed")])]})
+        self.assertEqual(code, 0)
+        self.assertIn("EVENT [g!2] failed", text)
+        self.assertIn("quiet [g!1]", text)
+
+    def test_many_drops_finished_mr_and_keeps_watching(self):
+        merged = snap(self.watcher, state="merged")
+        self.assertEqual(self.run_many({"1": [merged], "2": [snap(self.watcher)]})[0], 0)
+        failed = snap(self.watcher, statuses=[status(1, "t", "failed")])
+        code, text = self.run_many({"1": [merged], "2": [snap(self.watcher), failed]})
+        self.assertEqual(code, 0)
+        self.assertIn("DONE [g!1]", text)
+        self.assertIn("EVENT [g!2] failed", text)
+
+    def test_many_all_finished_exits_4(self):
+        merged = snap(self.watcher, state="merged")
+        self.run_many({"1": [merged], "2": [merged]})
+        self.assertEqual(self.run_many({"1": [merged], "2": [merged]})[0], 4)
+
+    def test_many_event_kept_when_other_mr_errors(self):
+        failed = snap(self.watcher, statuses=[status(1, "t", "failed")])
+        code, text = self.run_many({"1": [failed], "2": [OSError("blip")]})
+        self.assertEqual(code, 0)
+        self.assertIn("EVENT [g!1] failed", text)
+
+    def test_many_event_kept_when_other_mr_not_found(self):
+        failed = snap(self.watcher, statuses=[status(1, "t", "failed")])
+        code, text = self.run_many({"1": [failed], "2": [self.watcher.NotFound("x")]})
+        self.assertEqual(code, 0)
+        self.assertIn("EVENT [g!1] failed", text)
+
+    def test_many_done_handled_while_other_mr_errors(self):
+        merged = snap(self.watcher, state="merged")
+        self.run_many({"1": [merged], "2": [snap(self.watcher)]})
+        failed = snap(self.watcher, statuses=[status(1, "t", "failed")])
+        code, text = self.run_many({"1": [merged], "2": [OSError("blip"), failed]})
+        self.assertEqual(code, 0)
+        self.assertIn("DONE [g!1]", text)
+
     def test_event_survives_state_write_failure(self):
         with mock.patch.object(self.watcher.os, "replace", side_effect=OSError("disk full")), \
                 mock.patch("sys.stderr"):
             self.assertEqual(self.run_watch([snap(self.watcher, state="merged")]), 0)
+
+
+class SessionClose(unittest.TestCase):
+    closer = load("bin/session-close")
+
+    def test_temp_paths_keep_only_safe_prefixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "DEVOPS-1.md"), "w") as f:
+                f.write("# DEVOPS-1\n- /etc/passwd\n## Temp files\n- `/tmp/x-1`\n- mac:/tmp/y\n"
+                        "- mac:/Users/mac/Desktop/keep\n- /tmp/../etc\n- /tmp/\n## Notes\n- /tmp/not-listed\n")
+            with mock.patch.object(self.closer, "HANDOFF", tmp), \
+                    mock.patch.object(self.closer, "SCRATCH_ROOT", tmp + "/none"):
+                safe, skipped = self.closer.temp_paths("DEVOPS-1", "/workspaces/.worktrees/r-DEVOPS-1")
+        self.assertEqual(safe, [("devpod", "/tmp/x-1"), ("mac", "/tmp/y")])
+        self.assertEqual(sorted(skipped), [("devpod", "/etc"), ("devpod", "/tmp"), ("mac", "/Users/mac/Desktop/keep")])
+
+    def test_temp_paths_refuse_globs_metachars_and_other_scratchpads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "DEVOPS-2.md"), "w") as f:
+                f.write("## Temp files\n- mac:/tmp/harbor-*\n- mac:/tmp/x;rm\n- /tmp/scr\n- /tmp/scr/-other-session\n")
+            with mock.patch.object(self.closer, "HANDOFF", tmp), \
+                    mock.patch.object(self.closer, "SCRATCH_ROOT", "/tmp/scr"):
+                safe, skipped = self.closer.temp_paths("DEVOPS-2", "/workspaces/.worktrees/r-DEVOPS-2")
+        self.assertEqual(safe, [])
+        self.assertEqual(len(skipped), 4)
 
 
 class Install(unittest.TestCase):

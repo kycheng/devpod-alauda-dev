@@ -60,7 +60,8 @@ After editing, `source /workspaces/.claude/devpod.env` (or open a new shell) and
 
 | Item | Purpose |
 |---|---|
-| `pr-watch <mr-url>` | Exits only when an MR needs attention, so a background run replaces timer polling. `--once` prints the status. The host comes from the URL; a Mac `glab` over `ssh` is the fallback. |
+| `pr-watch <mr-url>...` | Exits only when one of the given MRs needs attention, so one background run replaces timer polling and per-MR watchers. Merged MRs drop out; default timeout 24h. `--once` prints the status. The host comes from the URL; a Mac `glab` over `ssh` is the fallback. |
+| `session-close <key>` | Closes a finished Discord-bound session: checks for unpushed commits and Jira close-out, then (with `--yes`) kills the zellij session, removes the binding (with a backup), the worktree, the scratchpad and the handoff's `## Temp files`, and archives the handoff. Dry run by default. |
 | `discord-reply-guard` (Stop) | Blocks ending a turn while the latest Discord message has no reply. |
 | `prod-write-guard` (PreToolUse) | Blocks `kubectl`/`oc`/`helm` writes whose kubeconfig or context name has a `prod` or `prd` segment, in every permission mode, including through `ssh`, `bash -c` and shell heredocs. Use the `!` prefix to run one yourself. It cannot see inside scripts, `$(...)`, loop variables or direct API calls, so it is a guard rail, not a security boundary. |
 | `compact-snapshot` (PreCompact, SessionStart) | Saves MR links and recent instructions before compaction and points the session to them afterwards. |
