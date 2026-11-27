@@ -223,23 +223,29 @@ def watch_many(targets, interval, timeout, sleep=time.sleep, clock=time.time):
     deadline = clock() + timeout
     failures = 0
     while clock() < deadline:
-        events, done, error = [], [], None
+        events, done, error, missing, ok = [], [], None, None, 0
         for target in targets:
             try:
                 found = target.check()
             except NotFound as err:
-                print(f"MR not found: {err}")
-                return 3
+                missing = err
+                continue
             except API_ERRORS as err:
                 # Keep checking the others: an event found this round is already saved
                 # as reported, so it must be printed rather than dropped.
                 error = err
                 continue
+            ok += 1
             if found:
                 events.append((target, found))
             elif target.snap["state"] != "opened":
                 done.append(target)
-        if error and not events:
+        if missing and not events:
+            print(f"MR not found: {missing}")
+            return 3
+        if missing:
+            print(f"MR not found (re-arm without it): {missing}")
+        if error and not ok:
             failures += 1
             if failures >= MAX_API_FAILURES:
                 print(f"API unreachable after {failures} attempts: {error}")

@@ -18,7 +18,7 @@ Run these steps without waiting to be asked. Stop only at the listed decision po
 - **Epic notes:** record any finding a sibling ticket would hit in `/workspaces/.claude/epics/<EPIC>.md`, and read that file again before acceptance.
 - **Status card (Discord):** send one message listing MRs and pipeline links, current step and blockers, then update it with `edit_message`. Send a new reply only for an outcome or a decision, because edits do not ping. Include links unprompted.
 - **Waiting on the user:** any message that waits for the user to merge, review or decide ends with a `待你处理` list, one item per line with its link (MR, pipeline, Jira, report). The user asked "PR 发我" about 25 times in one month because this was missing.
-- **Temp files:** when you create files on the Mac or outside the scratchpad (test dirs, downloaded packages, scripts), list them under `## Temp files` in the handoff file as `- mac:/tmp/x` or `- /tmp/y`. `session-close` deletes exactly that list.
+- **Temp files:** when you create files on the Mac or outside the scratchpad (test dirs, downloaded packages, scripts), list them under `## Temp files` in the handoff file as `- mac:/tmp/x` or `- /tmp/y`. `session-close` deletes that list (paths outside `/tmp` and the Mac temp dirs, or with glob/shell characters, are skipped and printed), plus the cwd's scratchpad.
 - **Testing order:** connect from the Mac to the test cluster and get it passing there, then push and let the pipeline run.
 - **Tunables:** timeouts and similar values come from environment variables with defaults, so the next change needs no code edit.
 - **Docs:** write English only; Chinese is generated automatically.
@@ -52,7 +52,7 @@ When the only work left is waiting hours or days (stability or HA test runs, a r
 Do all of these, then report what changed:
 1. Jira: check that every MR is in `Output URL` (it should already be there from MR creation; add any missing), change summary and test results as a comment, required fields and status.
 2. Test environment: delete instances you created, keeping one demo instance if the user is still reviewing.
-3. When the user asks to close the session: run `session-close <JIRA>` (dry run). Fix every `OPEN` line it prints (unpushed commits, Jira status, Output URL, missing comment) or ask the user about it, then run `session-close <JIRA> --yes`. It kills the session, removes the binding (with a backup), the worktree (keeps the branch), the scratchpad and the `## Temp files` list, and archives the handoff file. Use `--force` only when the user says to skip an open item.
+3. When the user asks to close the session: run `session-close <JIRA>` (dry run). Fix every `OPEN` line it prints (unpushed commits, Jira status, Output URL, missing comment) or ask the user about it, then run `session-close <JIRA> --yes`. It kills the session, removes the binding (with a backup), the worktree (keeps the branch), the scratchpad and the `## Temp files` list, and archives the handoff file. Use `--force` only when the user says to skip an open item. Run from inside the session being closed, it kills that session last, so nothing after the `killing` line reaches Discord: send the user its dry-run summary first.
 
 ## Ask the user only for
 Scope changes, merge or tag without prior authorisation, actions on shared/edge/idp clusters, and anything customer-facing. Bring a recommendation.

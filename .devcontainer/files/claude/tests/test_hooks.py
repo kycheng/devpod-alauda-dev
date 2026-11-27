@@ -247,6 +247,20 @@ class PrWatch(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("EVENT [g!1] failed", text)
 
+    def test_many_event_kept_when_other_mr_not_found(self):
+        failed = snap(self.watcher, statuses=[status(1, "t", "failed")])
+        code, text = self.run_many({"1": [failed], "2": [self.watcher.NotFound("x")]})
+        self.assertEqual(code, 0)
+        self.assertIn("EVENT [g!1] failed", text)
+
+    def test_many_done_handled_while_other_mr_errors(self):
+        merged = snap(self.watcher, state="merged")
+        self.run_many({"1": [merged], "2": [snap(self.watcher)]})
+        failed = snap(self.watcher, statuses=[status(1, "t", "failed")])
+        code, text = self.run_many({"1": [merged], "2": [OSError("blip"), failed]})
+        self.assertEqual(code, 0)
+        self.assertIn("DONE [g!1]", text)
+
     def test_event_survives_state_write_failure(self):
         with mock.patch.object(self.watcher.os, "replace", side_effect=OSError("disk full")), \
                 mock.patch("sys.stderr"):
@@ -266,6 +280,16 @@ class SessionClose(unittest.TestCase):
                 safe, skipped = self.closer.temp_paths("DEVOPS-1", "/workspaces/.worktrees/r-DEVOPS-1")
         self.assertEqual(safe, [("devpod", "/tmp/x-1"), ("mac", "/tmp/y")])
         self.assertEqual(sorted(skipped), [("devpod", "/etc"), ("devpod", "/tmp"), ("mac", "/Users/mac/Desktop/keep")])
+
+    def test_temp_paths_refuse_globs_metachars_and_other_scratchpads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "DEVOPS-2.md"), "w") as f:
+                f.write("## Temp files\n- mac:/tmp/harbor-*\n- mac:/tmp/x;rm\n- /tmp/scr\n- /tmp/scr/-other-session\n")
+            with mock.patch.object(self.closer, "HANDOFF", tmp), \
+                    mock.patch.object(self.closer, "SCRATCH_ROOT", "/tmp/scr"):
+                safe, skipped = self.closer.temp_paths("DEVOPS-2", "/workspaces/.worktrees/r-DEVOPS-2")
+        self.assertEqual(safe, [])
+        self.assertEqual(len(skipped), 4)
 
 
 class Install(unittest.TestCase):
