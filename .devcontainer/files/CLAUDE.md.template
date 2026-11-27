@@ -56,6 +56,7 @@ Every call re-reads the whole context, so what enters it is paid for repeatedly.
 - **Waiting on MRs:** run one `pr-watch <mr-url> [<mr-url>...]` in the background for every MR you wait on; it exits only on an event. Don't poll on a timer as well, and don't run one watcher per MR.
 - **Wake-ups with nothing to act on** (a watcher timed out, a subagent says it is still waiting): re-arm and end the turn, without a reply. Subagents don't start background waits of their own; they block in the foreground with a timeout or return.
 - **Large output:** write it to a file and `grep` what you need.
+- **Long content for the user to read** (design docs, reviews, reports, anything over about a screen): write a Markdown file and run `mac-serve <file> [--name <slug>]`; it serves the file on the user's Mac at `http://127.0.0.1:8765/<slug>/`. In chat, send the link plus a one-line conclusion; don't paste the content. `mac-serve --stop` stops the server.
 - **Long-running work:** split by stage and keep `/workspaces/.claude/handoff/<ticket>.md` current so a new session can continue.
 - **Wrong direction:** record the conclusion and restart from it rather than stacking fixes. In a terminal session, suggest `/rewind`.
 
