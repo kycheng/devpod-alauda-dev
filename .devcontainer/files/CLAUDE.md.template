@@ -53,7 +53,8 @@ This file deliberately contains **no hostnames, no credentials, no internal infr
 
 Every call re-reads the whole context, so what enters it is paid for repeatedly.
 
-- **Waiting on an MR:** run `pr-watch <mr-url>` in the background; it exits only on an event. Don't poll on a timer as well.
+- **Waiting on MRs:** run one `pr-watch <mr-url> [<mr-url>...]` in the background for every MR you wait on; it exits only on an event. Don't poll on a timer as well, and don't run one watcher per MR.
+- **Wake-ups with nothing to act on** (a watcher timed out, a subagent says it is still waiting): re-arm and end the turn, without a reply. Subagents don't start background waits of their own; they block in the foreground with a timeout or return.
 - **Large output:** write it to a file and `grep` what you need.
 - **Long-running work:** split by stage and keep `/workspaces/.claude/handoff/<ticket>.md` current so a new session can continue.
 - **Wrong direction:** record the conclusion and restart from it rather than stacking fixes. In a terminal session, suggest `/rewind`.
@@ -63,6 +64,17 @@ Every call re-reads the whole context, so what enters it is paid for repeatedly.
 Split work yourself and delegate without being asked when it won't change what the main thread is doing: unrelated requests arriving mid-task, log and code research, reviews (use a fresh subagent that gets the diff, not your reasoning), exploratory testing, and independent subtasks. Use `isolation: "worktree"` when a subagent edits code.
 
 Keep in the main thread: decisions for the user, writes to the environment or worktree the main task is using, and merges, tags and outward-facing messages. Don't delegate a handful of calls you can run directly.
+
+## Reading the user's request
+
+- **"直接给我 X" / "只需要 X" / "给我命令"**: reply with X only (the command, the link, the value). No background, no alternatives, no extra checks.
+- **Diagnosis:** before naming a cause, list the facts you checked in the real run: which script or entry point actually ran, with which parameters, against which resources (storage classes, images, versions that exist on the cluster). A cause inferred from the repo alone is a hypothesis; say so.
+- **Constraints given late** ("只拷 amd64", "只读", "只看这个项目") apply to everything already in flight: stop and redo what violates them.
+- **When a step needs the user** (a merge, a command only they can run, a decision): ask for it once, with every link, and keep working on anything that doesn't depend on it.
+
+## Closing a session
+
+"关闭 / 清理 <key> 的 session（worktree、binding、临时文件）": run `session-close <key>` (dry run), resolve the `OPEN` items it prints, then `session-close <key> --yes`. Report its output. Don't do the steps by hand.
 
 ## Shared knowledge and tickets
 
